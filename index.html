@@ -3,7 +3,7 @@
 <tt>
 <h1>JS13K-zip</h1>
 <p>- Simplified <a href="https://xem.github.io/js13k-pack">J13K-pack</a>
-<p>- Just paste your index.html below and it will be zipped optimally
+<p>- Just paste your index.html below and it will be zipped "optimally" (zopfli + custom iterations + no max block splitting)
 <p>- A UTF-8 BOM will be included in the zipped file. No need to use &lt;meta charset=utf-8>
 <br><br>
 <b>
@@ -13,6 +13,7 @@
 <b>HTML</b>
 <br><br>
 <textarea id=html1 spellcheck=false>&lt;doctype html>&lt;title>MY GAME&lt;/title>&lt;body>HI&lt;/body></textarea>
+<p>Iterations: <input id=it type=number min=1 step=1 value=15 size=3>
 <br>
 <br>
 <p><button id=pack1>PACK</button> 
@@ -56,9 +57,10 @@ let zip = async () => {
   const defaultOptions = {
     verbose: false,
     verbose_more: false,
-    numiterations: 15,
+    numiterations: it.value,
     blocksplitting: true,
-    blocksplittingmax: 15,
+    blocksplittingmax: 0,
+    blocksplittinglast: true
   };
 
   function compress(input, format, options) {
