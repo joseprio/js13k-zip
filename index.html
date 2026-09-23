@@ -1,113 +1,146 @@
-﻿<!doctype html>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>JS13K-zip Optimizer</title>
+<style>
+body { font-family: monospace; font-size: 12px; margin: 20px; line-height: 1.5; }
+textarea { font-family: monospace; font-size: 11px; width: 100%; max-width: 750px; height: 160px; display: block; margin: 8px 0; }
+button { font-family: monospace; cursor: pointer; padding: 3px 8px; margin-right: 4px; }
+.section { margin-bottom: 16px; }
+.opts label { display: block; margin: 5px 0; }
+#report { background: #f4f4f4; border-left: 4px solid #00aa66; padding: 8px 12px; margin: 10px 0; max-width: 750px; display: none; }
+#dl1 { font-size: 13px; font-weight: bold; color: #007700; }
+</style>
+</head>
 <body id=b>
 <tt>
-<h1>JS13K-zip</h1>
-<p>- Simplified <a href="https://xem.github.io/js13k-pack">J13K-pack</a>
-<p>- Just paste your index.html below and it will be zipped "optimally" (zopfli + custom iterations + no max block splitting)
-<p>- A UTF-8 BOM will be included in the zipped file. No need to use &lt;meta charset=utf-8>
-<br><br>
-<b>
-<p><h2>Input</h2>
+<h1>JS13K-zip Optimizer</h1>
+<p>- Enhanced <a href="https://xem.github.io/js13k-pack">JS13K-pack</a> & ZIP optimizer for <a href="https://js13kgames.com">js13kGames</a>.
+<p>- Deflate engine: <a href="https://github.com/fhanau/Efficient-Compression-Tool">ECT</a>'s Zopfli fork compiled to WASM, run in parallel over many modes and seeds; the smallest DEFLATE blocks from all runs are recombined into the final stream.
+<p>- Also available from the command line: <code>node cli.mjs index.html -o entry.zip</code>
 <br>
 
-<b>HTML</b>
-<br><br>
-<textarea id=html1 spellcheck=false>&lt;doctype html>&lt;title>MY GAME&lt;/title>&lt;body>HI&lt;/body></textarea>
-<p>Iterations: <input id=it type=number min=1 step=1 value=15 size=3>
-<br>
-<br>
-<p><button id=pack1>PACK</button> 
-<br><br>
-<br><br>
-<p><b>Zip</b>
-<p><a href="" download="entry.zip" id=dl1>...</a>
+<div class="section">
+  <h2>Input HTML</h2>
+  <input type=file id=file1 accept=".html,.htm,text/html">
+  <textarea id=html1 spellcheck=false>&lt;!doctype html>&lt;title>MY GAME&lt;/title>&lt;body>HI&lt;/body></textarea>
+</div>
 
+<div class="section opts">
+  <b>Compression Settings:</b><br>
+  <label>Search preset:
+    <select id=preset>
+      <option value="fast">Fast (8 modes)</option>
+      <option value="normal" selected>Normal (30 modes + 2 seeds)</option>
+      <option value="max">Max (99 modes + 4 seeds)</option>
+    </select>
+  </label>
 
-<style>
-body { font-size: 11px }
-textarea { font-size: 9px; width: 600px; height: 130px; }
-</style>
+  <label>Extra search time: <input id=timeLimit type=number min=0 step=5 value=0 size=4> seconds
+    (keeps trying new seeds after the preset; 0 = off)</label>
 
-<script src="jszip.min.js"></script>
-<script src="zopfli/libzopfli.js"></script>
-<script src="zopfli/compress.js"></script>
-<script src="zopfli/byte-b64.js"></script>
+  <label>UTF-8 BOM:
+    <select id=bomSelect>
+      <option value="auto" selected>Auto (test both if non-ASCII)</option>
+      <option value="yes">Always include UTF-8 BOM</option>
+      <option value="no">Never include BOM</option>
+    </select>
+  </label>
 
-<script type=module defer>
+  <label>
+    <input type=checkbox id=stripWhitespace>
+    Strip trailing whitespace & HTML comments before zipping
+  </label>
+</div>
 
+<div class="section" style="margin: 15px 0;">
+  <button id=pack1 style="font-size: 13px; font-weight: bold; padding: 8px 18px;">PACK ZIP</button>
+  <div id="progressBox" style="display: none; align-items: center; gap: 10px; margin-top: 10px;">
+    <progress id="progressBar" value="0" max="100" style="width: 250px; height: 18px; vertical-align: middle;"></progress>
+    <span id="statusText" style="font-weight: bold; color: #0066cc;"></span>
+  </div>
+</div>
 
-// zip 
-let zip = async () => {
+<div class="section">
+  <div id=report></div>
+  <p><b>Zip Archive:</b></p>
+  <p><a href="" download="entry.zip" id=dl1>...</a></p>
+</div>
 
-  const z = window.Module;
-  var code = html1.value;
+<script type=module>
+import { optimize, variants } from './core.mjs';
 
-  function ensureByteBuffer(input) {
-    if (typeof input === 'string') {
-      const a = z.intArrayFromString(input);
-      a.length--; // because emscripten's intArrayFromString() adds trailing nul
-      return a;
-    } else if (Array.isArray(input)) {
-      return Uint8Array.from(input);
-    } else {
-      return input;
-    }
-  }
+file1.onchange = async () => {
+  if (file1.files[0]) html1.value = await file1.files[0].text();
+};
 
-  const defaultOptions = {
-    verbose: false,
-    verbose_more: false,
-    numiterations: it.value,
-    blocksplitting: true,
-    blocksplittingmax: 0,
-    blocksplittinglast: true
-  };
-
-  function compress(input, format, options) {
-    console.assert(input != null, "buffer must not be null");
-    console.assert(options != null, "options must not be null");
-
-    const byteBuffer = ensureByteBuffer(input);
-    const bufferPtr = z.allocate(byteBuffer, 'i8', z.ALLOC_NORMAL);
-
-    const opts = { ...defaultOptions, ...options };
-
-    const output = z._createZopfliJsOutput();
-    z._compress(bufferPtr, byteBuffer.length, output,
-      format,
-      opts.verbose,
-      opts.verbose_more,
-      opts.numiterations,
-      opts.blocksplitting,
-      opts.blocksplittingmax,
-    );
-
-    const outputPtr = z._getBuffer(output);
-    const outputSize = z._getBufferSize(output);
-
-    const result = z.HEAPU8.slice(outputPtr, outputPtr + outputSize);
-    z._deallocate(outputPtr);
-    z._deallocate(output);
-    z._deallocate(bufferPtr);
-
-    return result;
-  }
-
-  code = "\ufeff" + code;
-  var inflated = (new TextEncoder()).encode(code);
-  var deflated = compress(inflated, 2, defaultOptions);
-  var zipzop = makeZip("index.html", inflated, deflated);
-  var decoder = new TextDecoder('utf8');
-  var zipzop64 = bytesToBase64(zipzop);
-  dl1.setAttribute("download", "entry.zip");
-  dl1.innerHTML = "Download (" + zipzop.length + " bytes, " + (new Date()).toLocaleTimeString() + ")";
-  dl1.href = "data:application/zip;base64," + zipzop64;
-
+function createWorkers() {
+  const n = Math.max(1, navigator.hardwareConcurrency || 4);
+  return Array.from({ length: n }, () => {
+    const w = new Worker('ect/worker.mjs', { type: 'module' });
+    const waiting = new Map();
+    w.onmessage = e => { waiting.get(e.data.id)(e.data); waiting.delete(e.data.id); };
+    return { w, run: msg => new Promise(resolve => { waiting.set(msg.id, resolve); w.postMessage(msg); }) };
+  });
 }
-
 
 pack1.onclick = async () => {
-  zip();
-}
+  pack1.disabled = true;
+  progressBox.style.display = 'flex';
+  progressBar.value = 0;
+  statusText.innerText = 'Starting workers...';
+  report.style.display = 'none';
+  dl1.innerText = '...';
+  dl1.removeAttribute('href');
 
+  let code = html1.value;
+  if (stripWhitespace.checked) {
+    code = code.replace(/<!--[\s\S]*?-->/g, '').replace(/[ \t]+$/gm, '');
+  }
+
+  const workers = createWorkers();
+  const time = Math.max(0, +timeLimit.value || 0);
+  const t0 = performance.now();
+  try {
+    const res = await optimize({
+      inputs: variants(code, bomSelect.value),
+      workers,
+      preset: preset.value,
+      timeLimit: time,
+      onProgress: p => {
+        const secs = (performance.now() - t0) / 1000;
+        progressBar.value = 100 * (p.extra ? Math.min(1, secs / time) : p.done / p.total);
+        statusText.innerText = `${p.extra ? `+${p.done - p.total} extra runs` : `[${p.done}/${p.total}]`}`
+          + ` -${p.job.mode} seed ${p.job.seed}: ${p.size} B | best zip so far: ${p.bestZipSize} bytes`;
+      },
+    });
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const b = res.bestSingle;
+    progressBar.value = 100;
+    statusText.innerText = `Done in ${secs}s`;
+
+    const url = URL.createObjectURL(new Blob([res.zip], { type: 'application/zip' }));
+    dl1.href = url;
+    dl1.innerText = `Download entry.zip (${res.zip.length} bytes)`;
+
+    report.style.display = 'block';
+    report.innerHTML = `
+      <b>Optimization Summary:</b><br>
+      &bull; Final ZIP size: <b>${res.zip.length} bytes</b> (DEFLATE stream: ${res.deflated.length} bytes, ${res.blocks} blocks, ${res.variant})<br>
+      &bull; Uncompressed size: ${new TextEncoder().encode(code).length} bytes<br>
+      &bull; Best single run: ${b.size} bytes (ECT -${b.mode}, seed ${b.seed}, ${b.variant});
+        block recombination saved <b>${b.size - res.deflated.length} bytes</b><br>
+      &bull; ${res.runs.length} mode results from ${res.jobs} ECT runs on ${workers.length} workers in ${secs}s<br>
+      &bull; Remaining js13k budget: ${13312 - res.zip.length} bytes`;
+  } catch (e) {
+    statusText.innerText = 'Error: ' + e.message;
+    throw e;
+  } finally {
+    workers.forEach(({ w }) => w.terminate());
+    pack1.disabled = false;
+  }
+};
 </script>
+</body>
+</html>
