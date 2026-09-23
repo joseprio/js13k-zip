@@ -28,6 +28,7 @@ Functions to compress according to the DEFLATE specification, using the
 */
 
 #include "zopfli.h"
+#include "lz77.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -80,6 +81,21 @@ void ect_record_block(size_t instart, size_t inend, size_t bitstart, size_t bite
    modes k*10000+n for k <= K. ect_pass is the index of the current pass. */
 extern unsigned ect_emit_all, ect_pass, ect_range_start;
 const void* ect_cost_state(size_t* size);
+void ect_set_cost_state(const void* src);
+void ect_reset_mf_handoff(void);
+extern int ect_replay;
+/* js13k-zip: pass tasks. With ect_task_block >= 0 a pass only replays the
+   blocks before that block (see ect_replay) and then runs and emits that one
+   block; with -2 it only computes the block split. ect_task_nblocks receives
+   the pass's block count and ect_task_store the target block's LZ77 data
+   (passes that feed a next pass only). */
+extern int ect_task_block;
+extern size_t ect_task_nblocks;
+extern ZopfliLZ77Store ect_task_store;
+void EctDeflatePassTask(const ZopfliOptions* options, const unsigned char* in,
+                        size_t instart, size_t inend, unsigned char twiceMode,
+                        const unsigned short* litlens, const unsigned short* dists, size_t size,
+                        unsigned char* bp, unsigned char** out, size_t* outsize);
 
 size_t GetDynamicLengths2(unsigned* ll_lengths, unsigned* d_lengths, const size_t* ll_counts, const size_t* d_counts);
 #ifdef __cplusplus

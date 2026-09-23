@@ -38,12 +38,44 @@ size_t ect_deflate(const unsigned char* in, size_t insize, unsigned mode, unsign
   ect_emit_all = emit_all;
   ect_pass = 0;
   ect_range_start = range_start;
+  ect_set_cost_state(0);
   ZopfliOptions options;
   ZopfliInitOptions(&options, mode, 0, 0);
   unsigned char bp = 0;
   ZopfliDeflate(&options, 1, in, insize, &bp, &g_out, &g_outsize);
   return g_outsize;
 }
+/* One pass of a multi-pass run as an independent task (see ect_task_block in
+   deflate.h): block >= 0 emits just that block, -2 only computes the split.
+   twice_mode is the pass kind (0 single pass, 1 first, 3 middle, 2 last);
+   litlens/dists/size the previous pass's LZ77 data; cost_state the carried
+   cost model at the start of the pass (0 = zeroed, as for a first pass).
+   Returns the output size; ect_task_blocks() gives the pass's block count. */
+size_t ect_pass_task(const unsigned char* in, size_t inend, size_t range_start, unsigned mode, unsigned seed,
+                     unsigned pass, unsigned twice_mode, const unsigned short* litlens,
+                     const unsigned short* dists, size_t size, const void* cost_state, int block) {
+  free(g_out); g_out = 0; g_outsize = 0;
+  g_nblocks = 0;
+  free(ect_task_store.litlens); free(ect_task_store.dists);
+  ZopfliInitLZ77Store(&ect_task_store);
+  ect_seed = seed;
+  ect_emit_all = 1;
+  ect_pass = pass;
+  ect_set_cost_state(cost_state);
+  ZopfliOptions options;
+  ZopfliInitOptions(&options, mode, 0, 0);
+  unsigned char bp = 0;
+  ect_task_block = block;
+  EctDeflatePassTask(&options, in, range_start, inend, twice_mode, litlens, dists, size, &bp, &g_out, &g_outsize);
+  ect_task_block = -1;
+  return g_outsize;
+}
+size_t ect_task_blocks(void) { return ect_task_nblocks; }
+size_t ect_task_store_size(void) { return ect_task_store.size; }
+unsigned short* ect_task_litlens(void) { return ect_task_store.litlens; }
+unsigned short* ect_task_dists(void) { return ect_task_store.dists; }
+const void* ect_cost_state_ptr(void) { size_t n; return ect_cost_state(&n); }
+size_t ect_cost_state_size(void) { size_t n; ect_cost_state(&n); return n; }
 unsigned char* ect_output(void) { return g_out; }
 size_t ect_block_count(void) { return g_nblocks; }
 unsigned* ect_blocks(void) { return g_blocks; }

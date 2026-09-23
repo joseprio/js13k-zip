@@ -14,6 +14,6 @@ emcc ${EMFLAGS:--O3 -flto -msimd128 -mbulk-memory -mnontrapping-fptoint} -DNDEBU
   src/zopfli/lz77.c src/zopfli/squeeze.c src/zopfli/util.c src/LzFind.c \
   -sSTACK_SIZE=8MB -sINITIAL_MEMORY=16MB -sALLOW_MEMORY_GROWTH=1 \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=web,worker,node -sSINGLE_FILE=1 \
-  -sEXPORTED_FUNCTIONS=_ect_deflate,_ect_output,_ect_block_count,_ect_blocks,_malloc,_free \
-  -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32 \
+  -sEXPORTED_FUNCTIONS=_ect_deflate,_ect_pass_task,_ect_task_blocks,_ect_task_store_size,_ect_task_litlens,_ect_task_dists,_ect_cost_state_ptr,_ect_cost_state_size,_ect_output,_ect_block_count,_ect_blocks,_malloc,_free \
+  -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU16,HEAPU32 \
   -o ${OUT:-ect-zopfli.mjs}

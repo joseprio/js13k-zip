@@ -880,6 +880,21 @@ const void* ect_cost_state(size_t* size) {
   return &st;
 }
 
+/* js13k-zip: sets the carried cost model (zeroes it for src == 0) and clears
+   the match finder hand-off flag, so a pass starts from an explicit state. */
+void ect_set_cost_state(const void* src) {
+  if (src) memcpy(&st, src, sizeof(st));
+  else memset(&st, 0, sizeof(st));
+}
+void ect_reset_mf_handoff(void) {
+  right = 0;
+}
+
+/* js13k-zip: when set, ZopfliLZ77Optimal only runs a block as far as needed to
+   reproduce the state it hands to the next block: the cost model saved at
+   iteration 4 and the match finder exported during iteration 1. */
+int ect_replay = 0;
+
 static void ZopfliLZ77Optimal(const ZopfliOptions* options,
                        const unsigned char* in, size_t instart, size_t inend,
                        ZopfliLZ77Store* store, unsigned char first, SymbolStats* statsp, unsigned mfinexport) {
@@ -1026,6 +1041,9 @@ static void ZopfliLZ77Optimal(const ZopfliOptions* options,
       CopyStats(&beststats, &st);
       stinit = 1;
     }
+    if (ect_replay && stinit){
+      break;
+    }
     if (lastrandomstep) {
       /* This makes it converge slower but better. Do it only once the
       randomness kicks in so that if the user does few iterations, it gives a
@@ -1043,7 +1061,7 @@ static void ZopfliLZ77Optimal(const ZopfliOptions* options,
     if(gui && options->numiterations < 6){break;}
   }
 
-  if (options->ultra){
+  if (options->ultra && !ect_replay){
     unsigned bl[288];
     unsigned bld[32];
 

@@ -78,14 +78,14 @@ file1.onchange = async () => {
   if (file1.files[0]) html1.value = await file1.files[0].text();
 };
 
-function createWorkers() {
-  const n = Math.max(1, navigator.hardwareConcurrency || 4);
-  return Array.from({ length: n }, () => {
-    const w = new Worker('ect/worker.mjs', { type: 'module' });
-    const waiting = new Map();
-    w.onmessage = e => { waiting.get(e.data.id)(e.data); waiting.delete(e.data.id); };
-    return { w, run: msg => new Promise(resolve => { waiting.set(msg.id, resolve); w.postMessage(msg); }) };
-  });
+function createWorker() {
+  const w = new Worker('ect/worker.mjs', { type: 'module' });
+  const waiting = new Map();
+  w.onmessage = e => {
+    const resolve = waiting.get(e.data.id);
+    if (resolve) { waiting.delete(e.data.id); resolve(e.data); }
+  };
+  return { run: msg => new Promise(resolve => { waiting.set(msg.id, resolve); w.postMessage(msg); }), terminate: () => w.terminate() };
 }
 
 pack1.onclick = async () => {
@@ -102,21 +102,22 @@ pack1.onclick = async () => {
     code = code.replace(/<!--[\s\S]*?-->/g, '').replace(/[ \t]+$/gm, '');
   }
 
-  const workers = createWorkers();
+  const workers = Math.max(1, navigator.hardwareConcurrency || 4);
   const time = Math.max(0, +timeLimit.value || 0);
   const t0 = performance.now();
   try {
     const res = await optimize({
       inputs: variants(code, bomSelect.value),
+      createWorker,
       workers,
       preset: preset.value,
       timeLimit: time,
       target: Math.max(0, +target.value || 0),
       onProgress: p => {
         const secs = (performance.now() - t0) / 1000;
-        progressBar.value = 100 * (p.extra ? Math.min(1, secs / time) : p.done / p.total);
-        statusText.innerText = `${p.extra ? `+${p.done - p.total} extra runs` : `[${p.done}/${p.total}]`}`
-          + ` -${p.job.mode} seed ${p.job.seed}: ${p.size === null ? `bytes ${p.job.start}-${p.job.end}` : p.size + ' B'}`
+        const presetShare = p.plannedDone / p.planned;
+        progressBar.value = 100 * (time && presetShare === 1 ? Math.min(1, secs / time) : presetShare);
+        statusText.innerText = `[preset ${p.plannedDone}/${p.planned}, ${p.extraDone} extra] ${p.what}`
           + ` | best zip so far: ${p.bestZipSize} bytes`;
       },
     });
@@ -136,13 +137,12 @@ pack1.onclick = async () => {
       &bull; Uncompressed size: ${new TextEncoder().encode(code).length} bytes<br>
       &bull; Best single run: ${b.size} bytes (ECT -${b.mode}, seed ${b.seed}, ${b.variant});
         block recombination saved <b>${b.size - res.deflated.length} bytes</b><br>
-      &bull; ${res.runs.length} mode results from ${res.jobs} ECT runs on ${workers.length} workers in ${secs}s<br>
+      &bull; ${res.runs.length} mode results from ${res.jobs} ECT tasks on ${workers} workers in ${secs}s<br>
       &bull; Remaining js13k budget: ${13312 - res.zip.length} bytes`;
   } catch (e) {
     statusText.innerText = 'Error: ' + e.message;
     throw e;
   } finally {
-    workers.forEach(({ w }) => w.terminate());
     pack1.disabled = false;
   }
 };

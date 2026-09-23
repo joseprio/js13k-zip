@@ -1076,6 +1076,10 @@ static void DeflateDynamicBlock(const ZopfliOptions* options, int final,
     ZopfliLZ77Optimal2(options, in, instart, inend, &store, *costmodelnotinited, statsp, mfinexport);
   }
   *costmodelnotinited = 0;
+  if (ect_replay){
+    ZopfliCleanLZ77Store(&store);
+    return;
+  }
 
   /* For small block, encoding with fixed tree can be smaller. For large block,
   don't bother doing this expensive test, dynamic tree will be better.*/
@@ -1319,7 +1323,14 @@ static void DeflateSplittingFirst(const ZopfliOptions* options,
   size_t* splitpoints = 0;
   size_t npoints = 0;
   SymbolStats* statsp = 0;
+  ect_reset_mf_handoff();
   ZopfliBlockSplit(options, in, instart, inend, &splitpoints, &npoints, &statsp, twiceMode, *twiceStore);
+  ect_task_nblocks = npoints + 1;
+  if (ect_task_block == -2 || (ect_task_block >= 0 && (size_t)ect_task_block > npoints)){
+    free(splitpoints);
+    free(statsp);
+    return;
+  }
 
   ZopfliLZ77Store* stores;
   if (twiceMode & 1){
@@ -1329,13 +1340,21 @@ static void DeflateSplittingFirst(const ZopfliOptions* options,
     }
   }
   for (size_t i = 0; i <= npoints; i++) {
+    if (ect_task_block >= 0 && i > (size_t)ect_task_block) break;
+    ect_replay = ect_task_block >= 0 && i < (size_t)ect_task_block;
     size_t start = i == 0 ? instart : splitpoints[i - 1];
     size_t end = i == npoints ? inend : splitpoints[i];
     unsigned x = npoints == 0 ? 0 : i == 0 ? 2 : i == npoints ? 1 : 3;
     DeflateDynamicBlock(options, i == npoints && final, in, start, end,
                         bp, out, outsize, costmodelnotinited, &(statsp[i]), twiceMode, stores + i, x);
+    ect_replay = 0;
   }
-  if (twiceMode & 1){
+  if ((twiceMode & 1) && ect_task_block >= 0){
+    /* Only the target block ran; hand its LZ77 data to the caller. */
+    ect_task_store = stores[ect_task_block];
+    free(stores);
+  }
+  else if (twiceMode & 1){
     ZopfliInitLZ77Store(twiceStore);
     for(int i = 0; i < npoints + 1; i++){
       twiceStore->litlens = (unsigned short*)realloc(twiceStore->litlens, sizeof(unsigned short) * (twiceStore->size + stores->size));
@@ -1368,6 +1387,32 @@ static void ZopfliDeflatePart(const ZopfliOptions* options, int final,
                        unsigned char* bp, unsigned char** out,
                        size_t* outsize, unsigned char* costmodelnotinited, unsigned char twiceMode, ZopfliLZ77Store* twiceStore) {
   DeflateSplittingFirst(options, final, in, instart, inend, bp, out, outsize, costmodelnotinited, twiceMode, twiceStore);
+}
+
+int ect_task_block = -1;
+size_t ect_task_nblocks = 0;
+ZopfliLZ77Store ect_task_store;
+
+/* js13k-zip: runs one pass (twiceMode as in ZopfliDeflate's pass loop) of the
+   range [instart, inend) as a task (see ect_task_block). litlens/dists/size
+   are the previous pass's LZ77 data for passes that split on it. */
+void EctDeflatePassTask(const ZopfliOptions* options, const unsigned char* in,
+                        size_t instart, size_t inend, unsigned char twiceMode,
+                        const unsigned short* litlens, const unsigned short* dists, size_t size,
+                        unsigned char* bp, unsigned char** out, size_t* outsize) {
+  ZopfliLZ77Store lf;
+  ZopfliInitLZ77Store(&lf);
+  if (twiceMode & 2){
+    /* ZopfliBlockSplit takes ownership of (and frees) these arrays. */
+    lf.litlens = (unsigned short*)malloc(size * sizeof(unsigned short) + 1);
+    lf.dists = (unsigned short*)malloc(size * sizeof(unsigned short) + 1);
+    memcpy(lf.litlens, litlens, size * sizeof(unsigned short));
+    memcpy(lf.dists, dists, size * sizeof(unsigned short));
+    lf.size = size;
+  }
+  ZopfliInitLZ77Store(&ect_task_store);
+  unsigned char costmodelnotinited = 1;
+  ZopfliDeflatePart(options, 1, in, instart, inend, bp, out, outsize, &costmodelnotinited, twiceMode, &lf);
 }
 
 /* js13k-zip: states seen between the passes of the current emit-all run: the
