@@ -12,17 +12,20 @@
 // cycles. Results are not monotonic in N, so many modes are searched.
 // A run of mode K*10000+n reports the results of every k*10000+n (k <= K) for
 // the price of one, and stops early once its passes reach a state they have
-// already been in (usually after 3-5 passes; see worker.mjs), so jobs are
-// [n, K] pairs and K is cheap to raise.
+// already been in (see worker.mjs), so jobs are [n, K] pairs. Inputs that
+// don't converge drift instead: on a 37 KB bundle the best pass was always
+// k <= 4, so K stays small.
 export const PRESETS = {
   fast: { jobs: [[9, 2], [100, 2], [300, 2], [1000, 0]], seeds: 0 },
-  normal: { jobs: [9, 60, 100, 300, 500, 1000].map(n => [n, 10]), seeds: 2 },
-  max: { jobs: [9, 30, 60, 100, 150, 200, 300, 500, 1000].map(n => [n, 30]), seeds: 4 },
+  normal: { jobs: [9, 60, 100, 300, 500, 1000].map(n => [n, 4]), seeds: 2 },
+  max: { jobs: [9, 30, 60, 100, 150, 200, 300, 500, 1000].map(n => [n, 6]), seeds: 4 },
 };
 
 // Jobs re-run with extra seeds. Seeds only matter when ECT runs enough
 // iterations to hit its randomization step (level >= 7 or explicit iterations).
-const SEED_JOBS = [[100, 10], [300, 10], [1000, 10]];
+// Picked by measured near-best results per CPU second on a roadrolled 15 KB
+// bundle; long jobs such as [1000, 10] were 5-10x less efficient.
+const SEED_JOBS = [[300, 2], [200, 1], [300, 1], [100, 4]];
 
 // Iterations per pass for a level or explicit count (ECT's util.c table).
 const iterations = n => (n > 9 ? n : [1, 1, 1, 2, 3, 8, 13, 60, 60][Math.max(n, 2) - 1]);
@@ -166,12 +169,13 @@ export function variants(text, bom = 'auto') {
 //   preset:    'fast' | 'normal' | 'max'
 //   timeLimit: seconds; after the planned jobs, keep trying new seeds until it
 //              elapses (0 = planned jobs only)
+//   target:    stop as soon as the zip is this many bytes or smaller (0 = off)
 //   onProgress({ done, total, extra, bestZipSize, job, size, variant })
 //              (size: best of the job's passes; runs lists every pass)
 //              (extra: past the planned jobs, running time-budget seeds)
 // Returns { zip, deflated, variant, nbits, blocks, runs, jobs, bestSingle }
 // (runs: one entry per mode result, jobs: ECT invocations).
-export async function optimize({ inputs, workers, preset = 'normal', timeLimit = 0, filename = 'index.html', onProgress = () => {} }) {
+export async function optimize({ inputs, workers, preset = 'normal', timeLimit = 0, target = 0, filename = 'index.html', onProgress = () => {} }) {
   const planned = planJobs(preset);
   const queue = inputs.flatMap(v => planned.map(j => ({ ...j, v }))).sort((a, b) => jobCost(b) - jobCost(a));
   const total = queue.length;
@@ -191,6 +195,7 @@ export async function optimize({ inputs, workers, preset = 'normal', timeLimit =
   };
 
   const next = () => {
+    if (target && best && best.zipSize <= target) return null;
     if (queue.length) return queue.shift();
     if (!deadline || Date.now() >= deadline) return null;
     if (!extraPending.length) {

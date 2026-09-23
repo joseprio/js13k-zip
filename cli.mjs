@@ -12,6 +12,7 @@ const { values: opts, positionals } = parseArgs({
     out: { type: 'string', short: 'o' },
     preset: { type: 'string', short: 'p', default: 'normal' },
     time: { type: 'string', short: 't', default: '0' },
+    target: { type: 'string', default: '0' },
     workers: { type: 'string', short: 'w' },
     bom: { type: 'string', default: 'auto' },
     name: { type: 'string', default: 'index.html' },
@@ -26,6 +27,7 @@ if (opts.help || positionals.length !== 1 || !PRESETS[opts.preset] || !['auto', 
   -o, --out <file>      output zip (default: <input>.zip)
   -p, --preset <name>   fast | normal | max (default: normal)
   -t, --time <sec>      after the preset, keep trying new seeds for <sec> seconds
+      --target <bytes>  stop as soon as the zip is <bytes> or smaller
   -w, --workers <n>     parallel workers (default: CPU count)
       --bom <mode>      auto | yes | no (default: auto; ASCII input never gets one)
       --name <file>     file name inside the zip (default: index.html)
@@ -48,7 +50,7 @@ const workers = Array.from({ length: nWorkers }, () => {
 const t0 = performance.now();
 const tty = process.stderr.isTTY && !opts.quiet;
 const res = await optimize({
-  inputs, workers, preset: opts.preset, timeLimit: +opts.time || 0, filename: opts.name,
+  inputs, workers, preset: opts.preset, timeLimit: +opts.time || 0, target: +opts.target || 0, filename: opts.name,
   onProgress: p => {
     if (!tty) return;
     const where = p.extra ? `+${p.done - p.total} extra` : `${p.done}/${p.total}`;
