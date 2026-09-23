@@ -18,7 +18,9 @@
 export const PRESETS = {
   fast: { jobs: [[9, 2], [100, 2], [300, 2], [1000, 0]], seeds: 0 },
   normal: { jobs: [9, 60, 100, 300, 500, 1000].map(n => [n, 4]), seeds: 2 },
-  max: { jobs: [9, 30, 60, 100, 150, 200, 300, 500, 1000].map(n => [n, 6]), seeds: 4 },
+  // max also completes 800 extra seed/range jobs: enough for every one of 6
+  // seed streams to reach the best size found for galaxy-raid (11110 B).
+  max: { jobs: [9, 30, 60, 100, 150, 200, 300, 500, 1000].map(n => [n, 6]), seeds: 4, extra: 800 },
 };
 
 // Jobs re-run with extra seeds. Seeds only matter when ECT runs enough
@@ -280,7 +282,7 @@ class Pool {
     while (this.idle.length && this.filler && this.speculative() < this.fillCap) {
       const job = this.filler();
       if (!job) break;
-      this.start(this.idle.pop(), { prio: 0, msg: job.msg, resolve: job.onResult, reject: () => {} });
+      this.start(this.idle.pop(), { prio: 0, msg: job.msg, resolve: job.onResult, reject: job.onDropped || (() => {}) });
     }
   }
 
@@ -308,6 +310,8 @@ class Pool {
 //   focus:        share of the extra jobs that re-compress single block ranges
 //                 of the current best chain instead of the whole input
 //   seedBase:     offset for the extra jobs' seeds (another random stream)
+//   extra:        number of extra jobs that must complete besides the preset
+//                 (default: the preset's own `extra`, 0 for fast/normal)
 //   fillCap:      max extra jobs running at once. Default: none without a
 //                 time limit (on an 8-core SMT CPU even 4 extra jobs slowed
 //                 the preset's critical path by 13-20%); no limit with one,
@@ -316,7 +320,7 @@ class Pool {
 // Returns { zip, deflated, variant, nbits, blocks, runs, jobs, bestSingle }
 // (runs: one entry per whole-input mode result, jobs: finished tasks).
 export async function optimize({ inputs, createWorker, workers = 4, preset = 'normal', timeLimit = 0, target = 0,
-  focus = 0.5, seedBase = 0, fillCap, filename = 'index.html', onProgress = () => {} }) {
+  focus = 0.5, seedBase = 0, fillCap, extra: extraBudget, filename = 'index.html', onProgress = () => {} }) {
   const pools = new Map(inputs.map(v => [v, new BlockPool(v.bytes.length)]));
   const deadline = timeLimit > 0 ? Date.now() + timeLimit * 1000 : 0;
   const runs = [];
@@ -328,12 +332,14 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
   let rangeCount = 0;
   let plannedDone = 0;
   let extraDone = 0;
+  let extraInFlight = 0;
   let jobs = 0;
   let stopped = false;
   let stop;
   const finished = new Promise(resolve => { stop = () => { stopped = true; resolve(); }; });
 
   const planned = planJobs(preset);
+  extraBudget = extraBudget ?? PRESETS[preset].extra ?? 0;
   const maxCost = Math.max(...planned.map(jobCost));
   const chains = inputs.flatMap(v => planned.map(job => ({ ...job, v })));
 
@@ -371,19 +377,26 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
   };
 
   const pool = new Pool(createWorker, workers);
-  pool.fillCap = fillCap ?? (deadline ? Infinity : 0);
+  pool.fillCap = fillCap ?? (deadline || extraBudget ? Infinity : 0);
+  const presetDone = () => plannedDone === chains.length;
+  const allDone = () => presetDone() && extraDone >= extraBudget && (!deadline || Date.now() >= deadline);
   pool.filler = () => {
-    if (stopped || !(plannedDone < chains.length || (deadline && Date.now() < deadline))) return null;
+    const wanted = extraDone + extraInFlight < extraBudget || !presetDone() || (deadline && Date.now() < deadline);
+    if (stopped || !wanted) return null;
     const job = nextExtra();
     const whole = job.end === undefined;
+    extraInFlight++;
     return {
       msg: { kind: 'deflate', bytes: job.v.bytes, mode: job.mode, seed: job.seed, start: job.start, end: job.end },
       onResult: r => {
+        extraInFlight--;
         jobs++;
         extraDone++;
         for (const pass of r.passes) addPass(job.v, pass, job.seed, whole);
         report(`-${job.mode} seed ${job.seed}` + (whole ? '' : ` bytes ${job.start}-${job.end}`));
+        if (allDone()) stop();
       },
+      onDropped: () => { extraInFlight--; },
     };
   };
 
@@ -396,9 +409,9 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
   }).then(() => { plannedDone++; }));
 
   // The preset always completes; a time limit only bounds the extra search.
-  if (deadline) setTimeout(() => { if (plannedDone === chains.length) stop(); }, Math.max(0, deadline - Date.now()));
+  if (deadline) setTimeout(() => { if (allDone()) stop(); }, Math.max(0, deadline - Date.now()));
   let failure = null;
-  Promise.all(chainRuns).then(() => { if (!deadline || Date.now() >= deadline) stop(); },
+  Promise.all(chainRuns).then(() => { if (allDone()) stop(); },
     e => { failure = e; stop(); });
   pool.pump();
   await finished;

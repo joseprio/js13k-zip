@@ -16,6 +16,7 @@ const { values: opts, positionals } = parseArgs({
     focus: { type: 'string', default: '0.5' },
     seed: { type: 'string', default: '0' },
     'fill-cap': { type: 'string' },
+    extra: { type: 'string' },
     workers: { type: 'string', short: 'w' },
     bom: { type: 'string', default: 'auto' },
     name: { type: 'string', default: 'index.html' },
@@ -34,6 +35,7 @@ if (opts.help || positionals.length !== 1 || !PRESETS[opts.preset] || !['auto', 
       --focus <0..1>    share of extra jobs spent re-compressing single blocks
                         of the best result (default: 0.5)
       --seed <n>        offset for the extra jobs' seeds (another random stream)
+      --extra <n>       also complete <n> extra jobs (default: the preset's)
       --fill-cap <n>    max extra jobs running alongside the preset
                         (default: none, or no limit with --time)
   -w, --workers <n>     parallel workers (default: CPU count)
@@ -63,7 +65,8 @@ const t0 = performance.now();
 const tty = process.stderr.isTTY && !opts.quiet;
 const res = await optimize({
   inputs, createWorker, workers: nWorkers, preset: opts.preset, timeLimit: +opts.time || 0, target: +opts.target || 0,
-  focus: +opts.focus, seedBase: parseInt(opts.seed, 10) || 0, fillCap: opts['fill-cap'] === undefined ? undefined : parseInt(opts['fill-cap'], 10) || 0, filename: opts.name,
+  focus: +opts.focus, seedBase: parseInt(opts.seed, 10) || 0, fillCap: opts['fill-cap'] === undefined ? undefined : parseInt(opts['fill-cap'], 10) || 0,
+  extra: opts.extra === undefined ? undefined : parseInt(opts.extra, 10) || 0, filename: opts.name,
   onProgress: p => {
     if (!tty) return;
     process.stderr.write(`\r[preset ${p.plannedDone}/${p.planned}, ${p.extraDone} extra] ${p.what} | best zip ${p.bestZipSize} B      `);
