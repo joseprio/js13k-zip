@@ -78,7 +78,7 @@ void ect_record_block(size_t instart, size_t inend, size_t bitstart, size_t bite
 /* js13k-zip: when set, every split/compress pass of a multi-pass mode also
    emits its blocks, so one run of mode K*10000+n yields the results of all
    modes k*10000+n for k <= K. ect_pass is the index of the current pass. */
-extern unsigned ect_emit_all, ect_pass;
+extern unsigned ect_emit_all, ect_pass, ect_range_start;
 const void* ect_cost_state(size_t* size);
 
 size_t GetDynamicLengths2(unsigned* ll_lengths, unsigned* d_lengths, const size_t* ll_counts, const size_t* d_counts);

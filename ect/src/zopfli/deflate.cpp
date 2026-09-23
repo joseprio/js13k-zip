@@ -1430,7 +1430,9 @@ void ZopfliDeflate(const ZopfliOptions* options, int final,
   ZopfliDeflatePart(options, final, in, 0, insize, bp, out, outsize, &costmodelnotinited);
 #else
 
-  size_t i = 0;
+  /* js13k-zip: ect_range_start > 0 compresses only [ect_range_start, insize),
+     using the preceding bytes as the LZ77 dictionary. */
+  size_t i = ect_range_start < insize ? ect_range_start : 0;
   size_t msize = ZOPFLI_MASTER_BLOCK_SIZE;
   unsigned char costmodelnotinited = 1;
   if (!options->isPNG && options->numiterations == 1){

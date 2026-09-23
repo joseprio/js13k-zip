@@ -1,5 +1,7 @@
 // ECT-zopfli worker, usable as a browser module Worker or a Node worker_threads Worker.
-// In:  { id, bytes: Uint8Array, mode, seed }
+// In:  { id, bytes: Uint8Array, mode, seed, start?, end? }
+//      (with start/end, only bytes[start..end) is compressed, the earlier bytes
+//      serving as dictionary; block positions stay absolute)
 // Out: { id, passes: [{ mode, size, blocks: [{ start, end, nbits, data }] }] }
 // A mode K*10000+n runs up to K+1 split/compress passes; pass k's blocks are
 // exactly what mode k*10000+n would output, so every pass is reported as its
@@ -20,13 +22,13 @@ function extractBits(src, from, to) {
   return out;
 }
 
-async function handle({ id, bytes, mode, seed }) {
+async function handle({ id, bytes, mode, seed, start = 0, end = bytes.length }) {
   const M = await ready;
   // ECT may read up to 8 bytes past the end of the input.
   const p = M._malloc(bytes.length + 8);
   M.HEAPU8.fill(0, p, p + bytes.length + 8);
   M.HEAPU8.set(bytes, p);
-  const size = M._ect_deflate(p, bytes.length, mode, seed, 1);
+  const size = M._ect_deflate(p, end, mode, seed, 1, start);
   M._free(p);
   const outPtr = M._ect_output();
   const out = M.HEAPU8.subarray(outPtr, outPtr + size);

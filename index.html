@@ -116,7 +116,8 @@ pack1.onclick = async () => {
         const secs = (performance.now() - t0) / 1000;
         progressBar.value = 100 * (p.extra ? Math.min(1, secs / time) : p.done / p.total);
         statusText.innerText = `${p.extra ? `+${p.done - p.total} extra runs` : `[${p.done}/${p.total}]`}`
-          + ` -${p.job.mode} seed ${p.job.seed}: ${p.size} B | best zip so far: ${p.bestZipSize} bytes`;
+          + ` -${p.job.mode} seed ${p.job.seed}: ${p.size === null ? `bytes ${p.job.start}-${p.job.end}` : p.size + ' B'}`
+          + ` | best zip so far: ${p.bestZipSize} bytes`;
       },
     });
     const secs = ((performance.now() - t0) / 1000).toFixed(1);

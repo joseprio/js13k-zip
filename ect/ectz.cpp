@@ -12,7 +12,7 @@ static size_t g_nblocks = 0, g_blockcap = 0;
 
 extern "C" {
 extern unsigned ect_seed;
-unsigned ect_emit_all = 0, ect_pass = 0;
+unsigned ect_emit_all = 0, ect_pass = 0, ect_range_start = 0;
 
 void ect_record_block(size_t instart, size_t inend, size_t bitstart, size_t bitend) {
   if (g_nblocks == g_blockcap) {
@@ -28,13 +28,16 @@ void ect_record_block(size_t instart, size_t inend, size_t bitstart, size_t bite
    the cost-model randomization (0 = upstream ECT output). With emit_all, the
    blocks of every pass are recorded (tagged with the pass index); the output
    buffer then holds all passes back to back and is only meaningful through
-   the block records. */
-size_t ect_deflate(const unsigned char* in, size_t insize, unsigned mode, unsigned seed, unsigned emit_all) {
+   the block records. range_start > 0 compresses only in[range_start..insize),
+   with the earlier bytes as dictionary (blocks then start at range_start). */
+size_t ect_deflate(const unsigned char* in, size_t insize, unsigned mode, unsigned seed, unsigned emit_all,
+                   size_t range_start) {
   free(g_out); g_out = 0; g_outsize = 0;
   g_nblocks = 0;
   ect_seed = seed;
   ect_emit_all = emit_all;
   ect_pass = 0;
+  ect_range_start = range_start;
   ZopfliOptions options;
   ZopfliInitOptions(&options, mode, 0, 0);
   unsigned char bp = 0;

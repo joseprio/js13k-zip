@@ -170,12 +170,15 @@ export function variants(text, bom = 'auto') {
 //   timeLimit: seconds; after the planned jobs, keep trying new seeds until it
 //              elapses (0 = planned jobs only)
 //   target:    stop as soon as the zip is this many bytes or smaller (0 = off)
+//   focus:     share of the extra jobs that re-compress single block ranges of
+//              the current best chain instead of the whole input
+//   seedBase:  offset for the extra jobs' seeds (another random stream)
 //   onProgress({ done, total, extra, bestZipSize, job, size, variant })
 //              (size: best of the job's passes; runs lists every pass)
 //              (extra: past the planned jobs, running time-budget seeds)
 // Returns { zip, deflated, variant, nbits, blocks, runs, jobs, bestSingle }
 // (runs: one entry per mode result, jobs: ECT invocations).
-export async function optimize({ inputs, workers, preset = 'normal', timeLimit = 0, target = 0, filename = 'index.html', onProgress = () => {} }) {
+export async function optimize({ inputs, workers, preset = 'normal', timeLimit = 0, target = 0, focus = 0.5, seedBase = 0, filename = 'index.html', onProgress = () => {} }) {
   const planned = planJobs(preset);
   const queue = inputs.flatMap(v => planned.map(j => ({ ...j, v }))).sort((a, b) => jobCost(b) - jobCost(a));
   const total = queue.length;
@@ -187,6 +190,8 @@ export async function optimize({ inputs, workers, preset = 'normal', timeLimit =
   let best = null;
   let extraPending = [];
   let done = 0;
+  let extraCount = 0;
+  let rangeCount = 0;
 
   const refresh = v => {
     const b = pools.get(v).best();
@@ -198,9 +203,18 @@ export async function optimize({ inputs, workers, preset = 'normal', timeLimit =
     if (target && best && best.zipSize <= target) return null;
     if (queue.length) return queue.shift();
     if (!deadline || Date.now() >= deadline) return null;
+    // Range jobs: re-compress one block range of the current best chain. They
+    // cost a fraction of a whole-file run and each range improves on its own.
+    if (best && best.blocks.length > 1 && ++extraCount * focus >= rangeCount + 1) {
+      const k = rangeCount++;
+      const b = best.blocks[k % best.blocks.length];
+      const [n, K] = SEED_JOBS[Math.floor(k / best.blocks.length) % SEED_JOBS.length];
+      const seed = 1 + seedBase + Math.floor(k / (best.blocks.length * SEED_JOBS.length));
+      return { mode: K * 10000 + n, seed, v: best.v, start: b.start, end: b.end };
+    }
     if (!extraPending.length) {
       const j = extra.next().value;
-      extraPending = inputs.map(v => ({ ...j, v }));
+      extraPending = inputs.map(v => ({ ...j, seed: j.seed + seedBase, v }));
     }
     return extraPending.shift();
   };
@@ -208,16 +222,18 @@ export async function optimize({ inputs, workers, preset = 'normal', timeLimit =
   let id = 0;
   await Promise.all(workers.map(async w => {
     for (let job; (job = next()); ) {
-      const r = await w.run({ id: id++, bytes: job.v.bytes, mode: job.mode, seed: job.seed });
+      const r = await w.run({ id: id++, bytes: job.v.bytes, mode: job.mode, seed: job.seed, start: job.start, end: job.end });
       done++;
       let improved = false;
       for (const pass of r.passes) {
-        runs.push({ mode: pass.mode, seed: job.seed, variant: job.v.label, size: pass.size });
-        if (!bestSingle || pass.size < bestSingle.size) bestSingle = { mode: pass.mode, seed: job.seed, variant: job.v.label, size: pass.size };
+        if (job.end === undefined) {
+          runs.push({ mode: pass.mode, seed: job.seed, variant: job.v.label, size: pass.size });
+          if (!bestSingle || pass.size < bestSingle.size) bestSingle = { mode: pass.mode, seed: job.seed, variant: job.v.label, size: pass.size };
+        }
         improved = pools.get(job.v).add(pass.blocks) || improved;
       }
       if (improved) refresh(job.v);
-      const size = Math.min(...r.passes.map(pass => pass.size));
+      const size = job.end === undefined ? Math.min(...r.passes.map(pass => pass.size)) : null;
       onProgress({
         done, total, extra: done > total,
         bestZipSize: best.zipSize, job, size, variant: job.v.label,
