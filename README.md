@@ -1,8 +1,8 @@
 # js13k-zip
 
 Squeezes the last bytes out of a [js13kGames](https://js13kgames.com) entry: it
-packs your `index.html` into the smallest ZIP it can find, in the browser or
-from the command line.
+packs your `index.html` into the smallest ZIP it can find, or recompresses an
+existing entry ZIP, in the browser or from the command line.
 
 **Try it: [joseprio.github.io/js13k-zip](https://joseprio.github.io/js13k-zip/)**
 
@@ -43,7 +43,8 @@ Times on an 8-core / 16-thread laptop CPU.
 ## Web
 
 Open the [page](https://joseprio.github.io/js13k-zip/), paste your HTML or
-pick a file, choose a preset and press **PACK ZIP**. Everything runs locally in
+pick a file (HTML, or a ZIP to recompress), choose a preset and press
+**PACK ZIP**. Everything runs locally in
 Web Workers; nothing is uploaded. The page must be served over HTTP (it uses
 ES modules), so to run it locally use any static server, e.g.
 `npx serve` or `python -m http.server`.
@@ -57,11 +58,17 @@ node cli.mjs dist/index.html -o dist/entry.zip            # normal preset
 node cli.mjs dist/index.html -o dist/entry.zip -p max     # best result
 node cli.mjs dist/index.html -o dist/entry.zip -t 30      # search 30 more seconds
 node cli.mjs dist/index.html -o dist/entry.zip -t 300 --target 11110  # stop early
+node cli.mjs dist/build.zip -o dist/build.zip -p max       # recompress a zip in place
 ```
+
+A `.zip` input (recognised by its `PK` signature) is recompressed file by file:
+every entry is extracted (stored or deflated, CRC-checked) and packed again with
+the same name, order and exact contents, and stored instead if that's smaller.
+Multi-file entries work too. Without `-o`, the result goes to `<input>.min.zip`.
 
 | Option | |
 |---|---|
-| `-o, --out <file>` | output zip (default: `<input>.zip`) |
+| `-o, --out <file>` | output zip (default: `<input>.zip`, or `<input>.min.zip` for a zip) |
 | `-p, --preset <name>` | `fast`, `normal` (default) or `max` |
 | `-t, --time <sec>` | after the preset, keep searching for `<sec>` seconds |
 | `--target <bytes>` | stop as soon as the zip is this size or smaller |
@@ -69,8 +76,8 @@ node cli.mjs dist/index.html -o dist/entry.zip -t 300 --target 11110  # stop ear
 | `--seed <n>` | use a different random stream for the extra jobs |
 | `--focus <0..1>` | share of extra jobs spent on single blocks (default 0.5) |
 | `-w, --workers <n>` | parallel workers (default: CPU count) |
-| `--bom auto\|yes\|no` | UTF-8 BOM handling (ASCII input never gets one) |
-| `--name <file>` | file name inside the zip (default `index.html`) |
+| `--bom auto\|yes\|no` | UTF-8 BOM handling (ASCII input never gets one; HTML input only) |
+| `--name <file>` | file name inside the zip (default `index.html`; HTML input only) |
 | `-q, --quiet` | only print the final size |
 
 In a build script:

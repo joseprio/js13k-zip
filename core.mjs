@@ -182,33 +182,111 @@ export function crc32(bytes) {
   return (crc ^ -1) >>> 0;
 }
 
-// Minimal single-file ZIP (118 bytes of overhead for "index.html").
-// Timestamp is fixed at the DOS epoch so output is deterministic.
-export function makeZip(filename, inflated, deflated) {
-  const name = new TextEncoder().encode(filename);
+// Minimal ZIP writer. entries: [{ name: Uint8Array, data: Uint8Array,
+// deflated: Uint8Array | null, utf8?: boolean }]; entries without a deflated
+// stream are stored, utf8 sets the "name is UTF-8" flag. 98 bytes of overhead per file plus twice its name. Timestamps are
+// fixed at the DOS epoch so output is deterministic.
+export function makeZipEntries(entries) {
   const two = v => [v & 255, (v >>> 8) & 255];
   const four = v => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
   const datetime = four(0x00210000); // 1980-01-01 00:00:00
-  const crc = four(crc32(inflated));
-  const csize = four(deflated.length);
-  const usize = four(inflated.length);
-  const nlen = two(name.length);
-  const local = [0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0, 8, 0, ...datetime, ...crc, ...csize, ...usize, ...nlen, 0, 0, ...name];
-  const central = [0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0, 8, 0, ...datetime, ...crc, ...csize, ...usize, ...nlen,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...name];
-  const end = [0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 1, 0, 1, 0, ...four(central.length),
-    ...four(local.length + deflated.length), 0, 0];
-  const zip = new Uint8Array(local.length + deflated.length + central.length + end.length);
-  zip.set(local, 0);
-  zip.set(deflated, local.length);
-  zip.set(central, local.length + deflated.length);
-  zip.set(end, local.length + deflated.length + central.length);
+  const parts = [];
+  const central = [];
+  let offset = 0;
+  for (const { name, data, deflated, utf8 } of entries) {
+    const method = deflated ? 8 : 0;
+    const body = deflated || data;
+    const common = [0, utf8 ? 8 : 0, method, 0, ...datetime, ...four(crc32(data)), ...four(body.length), ...four(data.length), ...two(name.length)];
+    const local = [0x50, 0x4b, 0x03, 0x04, 20, 0, ...common, 0, 0, ...name];
+    central.push(0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, ...common, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...four(offset), ...name);
+    parts.push(local, body);
+    offset += local.length + body.length;
+  }
+  const end = [0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, ...two(entries.length), ...two(entries.length),
+    ...four(central.length), ...four(offset), 0, 0];
+  parts.push(central, end);
+  const zip = new Uint8Array(parts.reduce((a, p) => a + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    zip.set(p, o);
+    o += p.length;
+  }
   return zip;
+}
+
+// Minimal single-file ZIP (118 bytes of overhead for "index.html").
+export function makeZip(filename, inflated, deflated) {
+  return makeZipEntries([{ name: new TextEncoder().encode(filename), data: inflated, deflated, utf8: /[^\x00-\x7f]/.test(filename) }]);
 }
 
 export async function inflateRaw(deflated) {
   const stream = new Blob([deflated]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
   return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+export const isZip = bytes => bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 3 && bytes[3] === 4;
+
+// Reads a ZIP (stored or deflated entries, no encryption or ZIP64) through its
+// central directory. Returns [{ name: Uint8Array, data: Uint8Array, utf8 }] in
+// order (utf8: the entry's "name is UTF-8" flag).
+export async function readZip(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 22 - 65535); i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('Not a ZIP file (no end of central directory record)');
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const files = [];
+  for (let k = 0; k < count; k++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('Corrupt ZIP central directory');
+    const flags = dv.getUint16(p + 8, true);
+    const method = dv.getUint16(p + 10, true);
+    const crc = dv.getUint32(p + 16, true);
+    const csize = dv.getUint32(p + 20, true);
+    const usize = dv.getUint32(p + 24, true);
+    const nlen = dv.getUint16(p + 28, true);
+    const xlen = dv.getUint16(p + 30, true);
+    const clen = dv.getUint16(p + 32, true);
+    const offset = dv.getUint32(p + 42, true);
+    const name = bytes.slice(p + 46, p + 46 + nlen);
+    const label = new TextDecoder().decode(name);
+    if (flags & 1) throw new Error(`${label}: encrypted entries are not supported`);
+    const start = offset + 30 + dv.getUint16(offset + 26, true) + dv.getUint16(offset + 28, true);
+    const raw = bytes.subarray(start, start + csize);
+    let data;
+    if (method === 0) data = raw.slice();
+    else if (method === 8) data = await inflateRaw(raw);
+    else throw new Error(`${label}: compression method ${method} is not supported`);
+    if (data.length !== usize || crc32(data) !== crc) throw new Error(`${label}: size or CRC mismatch`);
+    files.push({ name, data, utf8: !!(flags & 0x800) });
+    p += 46 + nlen + xlen + clen;
+  }
+  return files;
+}
+
+// Recompresses every file of a ZIP with optimize() (options as for it, minus
+// inputs/filename), keeping names, order and exact contents. Files that don't
+// shrink are stored. onFile({ index, count, name }) runs before each file.
+// Returns { zip, files: [{ name, size, compressed, stored }] }.
+export async function recompressZip({ zip, onFile = () => {}, target = 0, ...opts }) {
+  const files = await readZip(zip);
+  const entries = [];
+  const report = [];
+  for (const [index, f] of files.entries()) {
+    const name = new TextDecoder().decode(f.name);
+    onFile({ index, count: files.length, name });
+    let deflated = null;
+    if (f.data.length) {
+      const res = await optimize({ ...opts, inputs: [{ label: 'as is', bytes: f.data }], filename: name,
+        target: files.length === 1 ? target : 0 });
+      if (res.deflated.length < f.data.length) deflated = res.deflated;
+    }
+    entries.push({ name: f.name, data: f.data, deflated, utf8: f.utf8 });
+    report.push({ name, size: f.data.length, compressed: (deflated || f.data).length, stored: !deflated });
+  }
+  return { zip: makeZipEntries(entries), files: report };
 }
 
 // Input variants to try: the UTF-8 bytes with and/or without a BOM.

@@ -18,12 +18,14 @@ button { font-family: monospace; cursor: pointer; padding: 3px 8px; margin-right
 <h1>JS13K-zip Optimizer</h1>
 <p>- Enhanced <a href="https://xem.github.io/js13k-pack">JS13K-pack</a> & ZIP optimizer for <a href="https://js13kgames.com">js13kGames</a>.
 <p>- Deflate engine: <a href="https://github.com/fhanau/Efficient-Compression-Tool">ECT</a>'s Zopfli fork compiled to WASM, run in parallel over many modes and seeds; the smallest DEFLATE blocks from all runs are recombined into the final stream.
+<p>- Pick a .zip to recompress an existing entry (every file keeps its name and exact contents).
 <p>- Also available from the command line: <code>node cli.mjs index.html -o entry.zip</code>
 <br>
 
 <div class="section">
-  <h2>Input HTML</h2>
-  <input type=file id=file1 accept=".html,.htm,text/html">
+  <h2>Input HTML or ZIP</h2>
+  <input type=file id=file1 accept=".html,.htm,.zip,text/html,application/zip">
+  <button type=button id=clearZip style="display: none">Use the text box instead</button>
   <textarea id=html1 spellcheck=false>&lt;!doctype html>&lt;title>MY GAME&lt;/title>&lt;body>HI&lt;/body></textarea>
 </div>
 
@@ -72,10 +74,31 @@ button { font-family: monospace; cursor: pointer; padding: 3px 8px; margin-right
 </div>
 
 <script type=module>
-import { optimize, variants } from './core.mjs';
+import { isZip, optimize, recompressZip, variants } from './core.mjs';
 
+// A picked .zip is recompressed instead of the text box.
+let zipInput = null;
+const setZip = z => {
+  zipInput = z;
+  html1.readOnly = !!z;
+  clearZip.style.display = z ? '' : 'none';
+};
 file1.onchange = async () => {
-  if (file1.files[0]) html1.value = await file1.files[0].text();
+  const f = file1.files[0];
+  if (!f) return;
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  if (isZip(bytes)) {
+    setZip({ name: f.name, bytes });
+    html1.value = `Recompressing ${f.name} (${bytes.length} bytes); this text box is ignored.`;
+  } else {
+    setZip(null);
+    html1.value = new TextDecoder().decode(bytes);
+  }
+};
+clearZip.onclick = () => {
+  setZip(null);
+  file1.value = '';
+  html1.value = '';
 };
 
 function createWorker() {
@@ -105,22 +128,44 @@ pack1.onclick = async () => {
   const workers = Math.max(1, navigator.hardwareConcurrency || 4);
   const time = Math.max(0, +timeLimit.value || 0);
   const t0 = performance.now();
+  let fileLabel = '';
+  const search = {
+    createWorker,
+    workers,
+    preset: preset.value,
+    timeLimit: time,
+    target: Math.max(0, +target.value || 0),
+    onProgress: p => {
+      const secs = (performance.now() - t0) / 1000;
+      const presetShare = p.plannedDone / p.planned;
+      progressBar.value = 100 * (time && presetShare === 1 ? Math.min(1, secs / time) : presetShare);
+      statusText.innerText = `${fileLabel}[preset ${p.plannedDone}/${p.planned}, ${p.extraDone} extra] ${p.what}`
+        + ` | best zip so far: ${p.bestZipSize} bytes`;
+    },
+  };
   try {
-    const res = await optimize({
-      inputs: variants(code, bomSelect.value),
-      createWorker,
-      workers,
-      preset: preset.value,
-      timeLimit: time,
-      target: Math.max(0, +target.value || 0),
-      onProgress: p => {
-        const secs = (performance.now() - t0) / 1000;
-        const presetShare = p.plannedDone / p.planned;
-        progressBar.value = 100 * (time && presetShare === 1 ? Math.min(1, secs / time) : presetShare);
-        statusText.innerText = `[preset ${p.plannedDone}/${p.planned}, ${p.extraDone} extra] ${p.what}`
-          + ` | best zip so far: ${p.bestZipSize} bytes`;
-      },
-    });
+    if (zipInput) {
+      const res = await recompressZip({
+        ...search, zip: zipInput.bytes,
+        onFile: f => { fileLabel = f.count > 1 ? `${f.name} (${f.index + 1}/${f.count}) ` : ''; },
+      });
+      const secs = ((performance.now() - t0) / 1000).toFixed(1);
+      progressBar.value = 100;
+      statusText.innerText = `Done in ${secs}s`;
+      dl1.href = URL.createObjectURL(new Blob([res.zip], { type: 'application/zip' }));
+      dl1.innerText = `Download entry.zip (${res.zip.length} bytes)`;
+      const diff = res.zip.length - zipInput.bytes.length;
+      const esc = t => t.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+      report.style.display = 'block';
+      report.innerHTML = `
+        <b>Recompression Summary:</b><br>
+        &bull; ${esc(zipInput.name)}: ${zipInput.bytes.length} &rarr; <b>${res.zip.length} bytes</b> (${diff > 0 ? '+' : ''}${diff})<br>
+        ${res.files.map(f => `&bull; ${esc(f.name)}: ${f.size} &rarr; ${f.compressed} bytes${f.stored ? ' (stored)' : ''}<br>`).join('')}
+        &bull; ${workers} workers, ${secs}s<br>
+        &bull; Remaining js13k budget: ${13312 - res.zip.length} bytes`;
+      return;
+    }
+    const res = await optimize({ ...search, inputs: variants(code, bomSelect.value) });
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     const b = res.bestSingle;
     progressBar.value = 100;

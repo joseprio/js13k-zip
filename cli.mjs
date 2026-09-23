@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Command-line front end: node cli.mjs index.html -o entry.zip [options]
+// (a .zip input is recompressed file by file instead)
 import fs from 'node:fs';
 import os from 'node:os';
 import { parseArgs } from 'node:util';
 import { Worker } from 'node:worker_threads';
-import { PRESETS, optimize, variants } from './core.mjs';
+import { PRESETS, isZip, optimize, recompressZip, variants } from './core.mjs';
 
 const { values: opts, positionals } = parseArgs({
   allowPositionals: true,
@@ -26,9 +27,13 @@ const { values: opts, positionals } = parseArgs({
 });
 
 if (opts.help || positionals.length !== 1 || !PRESETS[opts.preset] || !['auto', 'yes', 'no'].includes(opts.bom)) {
-  console.error(`Usage: node cli.mjs <input.html> [options]
+  console.error(`Usage: node cli.mjs <input.html | input.zip> [options]
 
-  -o, --out <file>      output zip (default: <input>.zip)
+A .zip input is recompressed: every file is extracted and packed again with
+the same name and exact contents (--bom and --name don't apply).
+
+  -o, --out <file>      output zip (default: <input>.zip, or <input>.min.zip
+                        for a .zip input)
   -p, --preset <name>   fast | normal | max (default: normal)
   -t, --time <sec>      after the preset, keep trying new seeds for <sec> seconds
       --target <bytes>  stop as soon as the zip is <bytes> or smaller
@@ -46,8 +51,9 @@ if (opts.help || positionals.length !== 1 || !PRESETS[opts.preset] || !['auto', 
 }
 
 const input = positionals[0];
-const out = opts.out || input.replace(/\.[^./\\]*$/, '') + '.zip';
-const inputs = variants(fs.readFileSync(input, 'utf8'), opts.bom);
+const bytes = new Uint8Array(fs.readFileSync(input));
+const zipInput = isZip(bytes);
+const out = opts.out || input.replace(/\.[^./\\]*$/, '') + (zipInput ? '.min.zip' : '.zip');
 const nWorkers = Math.max(1, parseInt(opts.workers, 10) || os.availableParallelism?.() || os.cpus().length);
 
 const workerUrl = new URL('./ect/worker.mjs', import.meta.url);
@@ -62,25 +68,55 @@ const createWorker = () => {
 };
 
 const t0 = performance.now();
+const secs = () => ((performance.now() - t0) / 1000).toFixed(1);
 const tty = process.stderr.isTTY && !opts.quiet;
-const res = await optimize({
-  inputs, createWorker, workers: nWorkers, preset: opts.preset, timeLimit: +opts.time || 0, target: +opts.target || 0,
-  focus: +opts.focus, seedBase: parseInt(opts.seed, 10) || 0, fillCap: opts['fill-cap'] === undefined ? undefined : parseInt(opts['fill-cap'], 10) || 0,
-  extra: opts.extra === undefined ? undefined : parseInt(opts.extra, 10) || 0, filename: opts.name,
+let prefix = '';
+const search = {
+  createWorker, workers: nWorkers, preset: opts.preset, timeLimit: +opts.time || 0, target: +opts.target || 0,
+  focus: +opts.focus, seedBase: parseInt(opts.seed, 10) || 0,
+  fillCap: opts['fill-cap'] === undefined ? undefined : parseInt(opts['fill-cap'], 10) || 0,
+  extra: opts.extra === undefined ? undefined : parseInt(opts.extra, 10) || 0,
   onProgress: p => {
     if (!tty) return;
-    process.stderr.write(`\r[preset ${p.plannedDone}/${p.planned}, ${p.extraDone} extra] ${p.what} | best zip ${p.bestZipSize} B      `);
+    process.stderr.write(`\r${prefix}[preset ${p.plannedDone}/${p.planned}, ${p.extraDone} extra] ${p.what} | best zip ${p.bestZipSize} B      `);
   },
-});
-if (tty) process.stderr.write('\n');
+};
 
-fs.writeFileSync(out, res.zip);
-const secs = ((performance.now() - t0) / 1000).toFixed(1);
-if (opts.quiet) {
-  console.log(res.zip.length);
-} else {
-  const b = res.bestSingle;
-  console.log(`${out}: ${res.zip.length} bytes (${res.deflated.length} deflate, ${res.variant}, ${res.blocks} blocks)`);
-  console.log(`  best single run: ${b.size} deflate (-${b.mode} seed ${b.seed}, ${b.variant}); block recombination saved ${b.size - res.deflated.length} B`);
-  console.log(`  ${res.runs.length} mode results from ${res.jobs} ECT tasks on ${nWorkers} workers in ${secs}s; ${13312 - res.zip.length} bytes left of 13 KB`);
+try {
+  if (zipInput) {
+    const res = await recompressZip({
+      ...search, zip: bytes,
+      onFile: f => {
+        if (tty && f.index) process.stderr.write('\n');
+        prefix = f.count > 1 ? `${f.name} (${f.index + 1}/${f.count}) ` : '';
+      },
+    });
+    if (tty) process.stderr.write('\n');
+    fs.writeFileSync(out, res.zip);
+    if (opts.quiet) {
+      console.log(res.zip.length);
+    } else {
+      const diff = res.zip.length - bytes.length;
+      console.log(`${out}: ${bytes.length} -> ${res.zip.length} bytes (${diff > 0 ? '+' : ''}${diff})`);
+      for (const f of res.files) console.log(`  ${f.name}: ${f.size} -> ${f.compressed} bytes${f.stored ? ' (stored)' : ''}`);
+      console.log(`  ${secs()}s on ${nWorkers} workers; ${13312 - res.zip.length} bytes left of 13 KB`);
+    }
+  } else {
+    const inputs = variants(new TextDecoder().decode(bytes), opts.bom);
+    const res = await optimize({ ...search, inputs, filename: opts.name });
+    if (tty) process.stderr.write('\n');
+    fs.writeFileSync(out, res.zip);
+    if (opts.quiet) {
+      console.log(res.zip.length);
+    } else {
+      const b = res.bestSingle;
+      console.log(`${out}: ${res.zip.length} bytes (${res.deflated.length} deflate, ${res.variant}, ${res.blocks} blocks)`);
+      console.log(`  best single run: ${b.size} deflate (-${b.mode} seed ${b.seed}, ${b.variant}); block recombination saved ${b.size - res.deflated.length} B`);
+      console.log(`  ${res.runs.length} mode results from ${res.jobs} ECT tasks on ${nWorkers} workers in ${secs()}s; ${13312 - res.zip.length} bytes left of 13 KB`);
+    }
+  }
+} catch (e) {
+  if (tty) process.stderr.write('\n');
+  console.error(`${input}: ${e.message}`);
+  process.exit(1);
 }
