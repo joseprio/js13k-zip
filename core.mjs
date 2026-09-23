@@ -11,20 +11,23 @@
 // iteration count (>9); N / 10000 is the number of extra block-split/compress
 // cycles. Results are not monotonic in N, so many modes are searched.
 // A run of mode K*10000+n reports the results of every k*10000+n (k <= K) for
-// the price of one (see worker.mjs), so jobs are [n, K] pairs.
+// the price of one, and stops early once its passes reach a state they have
+// already been in (usually after 3-5 passes; see worker.mjs), so jobs are
+// [n, K] pairs and K is cheap to raise.
 export const PRESETS = {
-  fast: { jobs: [[9, 0], [100, 2], [300, 2], [1000, 0]], seeds: 0 },
-  normal: { jobs: [9, 60, 100, 300, 500, 1000].map(n => [n, 4]), seeds: 2 },
-  max: { jobs: [9, 30, 60, 100, 150, 200, 300, 500, 1000].map(n => [n, 10]), seeds: 4 },
+  fast: { jobs: [[9, 2], [100, 2], [300, 2], [1000, 0]], seeds: 0 },
+  normal: { jobs: [9, 60, 100, 300, 500, 1000].map(n => [n, 10]), seeds: 2 },
+  max: { jobs: [9, 30, 60, 100, 150, 200, 300, 500, 1000].map(n => [n, 30]), seeds: 4 },
 };
 
 // Jobs re-run with extra seeds. Seeds only matter when ECT runs enough
 // iterations to hit its randomization step (level >= 7 or explicit iterations).
-const SEED_JOBS = [[100, 4], [300, 4], [1000, 4]];
+const SEED_JOBS = [[100, 10], [300, 10], [1000, 10]];
 
 // Iterations per pass for a level or explicit count (ECT's util.c table).
 const iterations = n => (n > 9 ? n : [1, 1, 1, 2, 3, 8, 13, 60, 60][Math.max(n, 2) - 1]);
-const jobCost = ({ mode }) => iterations(mode % 10000) * (1 + Math.floor(mode / 10000));
+// Expected cost, for scheduling: runs rarely need more than ~5 passes.
+const jobCost = ({ mode }) => iterations(mode % 10000) * Math.min(5, 1 + Math.floor(mode / 10000));
 
 // Planned jobs for a preset: every [n, K] with the default seed, then `seeds`
 // extra seeds over SEED_JOBS; longest first so the workers finish together.

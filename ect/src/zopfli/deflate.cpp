@@ -31,6 +31,7 @@ Author: jyrki.alakuijala@gmail.com (Jyrki Alakuijala)
 #include <stdlib.h>
 #include <limits.h>
 #include <math.h>
+#include <string.h>
 
 #ifndef NOMULTI
 #include <thread>
@@ -1369,6 +1370,45 @@ static void ZopfliDeflatePart(const ZopfliOptions* options, int final,
   DeflateSplittingFirst(options, final, in, instart, inend, bp, out, outsize, costmodelnotinited, twiceMode, twiceStore);
 }
 
+/* js13k-zip: states seen between the passes of the current emit-all run: the
+   LZ77 store that the next pass splits on plus the carried cost model. A pass
+   is a pure function of that state, so once a state repeats, every further
+   pass repeats earlier output and the run can stop. */
+static unsigned char** ect_seen = 0;
+static size_t* ect_seen_len = 0;
+static size_t ect_nseen = 0;
+
+static void EctClearSeen() {
+  for (size_t i = 0; i < ect_nseen; i++) free(ect_seen[i]);
+  free(ect_seen);
+  free(ect_seen_len);
+  ect_seen = 0;
+  ect_seen_len = 0;
+  ect_nseen = 0;
+}
+
+static bool EctStateSeen(const ZopfliLZ77Store* store) {
+  size_t stsize;
+  const void* st = ect_cost_state(&stsize);
+  size_t arr = store->size * sizeof(unsigned short);
+  size_t len = stsize + 2 * arr;
+  unsigned char* key = (unsigned char*)malloc(len + 1);
+  memcpy(key, st, stsize);
+  memcpy(key + stsize, store->litlens, arr);
+  memcpy(key + stsize + arr, store->dists, arr);
+  for (size_t i = 0; i < ect_nseen; i++) {
+    if (ect_seen_len[i] == len && !memcmp(ect_seen[i], key, len)) {
+      free(key);
+      return true;
+    }
+  }
+  ect_seen = (unsigned char**)realloc(ect_seen, (ect_nseen + 1) * sizeof(*ect_seen));
+  ect_seen_len = (size_t*)realloc(ect_seen_len, (ect_nseen + 1) * sizeof(*ect_seen_len));
+  ect_seen[ect_nseen] = key;
+  ect_seen_len[ect_nseen++] = len;
+  return false;
+}
+
 /*TODO: in needs to be alloc'd 8 bytes past inend. This may cause crashes if code is modified and nonstandard alloc function is used for allocation of in*/
 void ZopfliDeflate(const ZopfliOptions* options, int final,
                    const unsigned char* in, size_t insize,
@@ -1408,12 +1448,17 @@ void ZopfliDeflate(const ZopfliOptions* options, int final,
     else{
       unsigned char cache = costmodelnotinited;
       ZopfliDeflatePart(options, final2, in, i, i + size, bp, out, outsize, &costmodelnotinited, 1, &lf);
+      EctClearSeen();
       for (int it = 0; it < options->twice; it++) {
+        if (ect_emit_all && EctStateSeen(&lf)){
+          break;
+        }
         ect_pass++;
         costmodelnotinited = cache;
         ZopfliDeflatePart(options, final2, in, i, i + size, bp, out, outsize, &costmodelnotinited, 2 + (it != options->twice - 1), &lf);
       }
     }
+    EctClearSeen();
     i += size;
   }
 #endif

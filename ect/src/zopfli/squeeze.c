@@ -873,6 +873,13 @@ static void LZ77OptimalRun(const ZopfliOptions* options, const unsigned char* in
 /*TODO: Replace this w/ proper implementation. This performs bad on files w/ changing redundancy */
 static thread_local SymbolStats st;
 
+/* js13k-zip: the cost model carried between blocks (and so between passes),
+   exposed so the pass loop can detect a state it has already seen. */
+const void* ect_cost_state(size_t* size) {
+  *size = sizeof(st);
+  return &st;
+}
+
 static void ZopfliLZ77Optimal(const ZopfliOptions* options,
                        const unsigned char* in, size_t instart, size_t inend,
                        ZopfliLZ77Store* store, unsigned char first, SymbolStats* statsp, unsigned mfinexport) {
@@ -955,6 +962,9 @@ static void ZopfliLZ77Optimal(const ZopfliOptions* options,
 
   LZCache c;
   int stinit = 0;
+  unsigned short* prevlitlens = 0;
+  unsigned short* prevdists = 0;
+  size_t prevsize = 0;
   if (options->useCache){
     CreateCache(inend - instart, &c);
   }
@@ -985,7 +995,21 @@ static void ZopfliLZ77Optimal(const ZopfliOptions* options,
     LZ77OptimalRun(options, in, instart, inend, length_array, &stats, &currentstore, options->useCache ? i == 1 ? 1 : 2 : 0, &c, mfinexport, 0);
 
     unsigned gui = 0;
-    cost = ZopfliCalculateBlockSize(currentstore.litlens, currentstore.dists, 0, currentstore.size, 2, options->searchext, currentstore.symbols);
+    /* js13k-zip: ~1 in 4 iterations reproduces the previous iteration's LZ77
+       data exactly; its cost is then lastcost, so skip recomputing it. */
+    size_t bytes = currentstore.size * sizeof(unsigned short);
+    if (i > 1 && prevsize == currentstore.size && !memcmp(prevlitlens, currentstore.litlens, bytes)
+        && !memcmp(prevdists, currentstore.dists, bytes)) {
+      cost = lastcost;
+    }
+    else {
+      cost = ZopfliCalculateBlockSize(currentstore.litlens, currentstore.dists, 0, currentstore.size, 2, options->searchext, currentstore.symbols);
+      prevlitlens = (unsigned short*)realloc(prevlitlens, bytes + 1);
+      prevdists = (unsigned short*)realloc(prevdists, bytes + 1);
+      memcpy(prevlitlens, currentstore.litlens, bytes);
+      memcpy(prevdists, currentstore.dists, bytes);
+      prevsize = currentstore.size;
+    }
     if (cost < bestcost) {
       /* Copy to the output store. */
       ZopfliCopyLZ77Store(&currentstore, store);
@@ -1105,6 +1129,8 @@ static void ZopfliLZ77Optimal(const ZopfliOptions* options,
     CleanCache(&c);
   }
   free(length_array);
+  free(prevlitlens);
+  free(prevdists);
   if (options->reuse_costmodel && !stinit){
     CopyStats(&beststats, &st);
   }

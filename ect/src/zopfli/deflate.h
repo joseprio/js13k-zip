@@ -79,6 +79,7 @@ void ect_record_block(size_t instart, size_t inend, size_t bitstart, size_t bite
    emits its blocks, so one run of mode K*10000+n yields the results of all
    modes k*10000+n for k <= K. ect_pass is the index of the current pass. */
 extern unsigned ect_emit_all, ect_pass;
+const void* ect_cost_state(size_t* size);
 
 size_t GetDynamicLengths2(unsigned* ll_lengths, unsigned* d_lengths, const size_t* ll_counts, const size_t* d_counts);
 #ifdef __cplusplus

@@ -1,10 +1,11 @@
 // ECT-zopfli worker, usable as a browser module Worker or a Node worker_threads Worker.
 // In:  { id, bytes: Uint8Array, mode, seed }
 // Out: { id, passes: [{ mode, size, blocks: [{ start, end, nbits, data }] }] }
-// A mode K*10000+n runs K+1 split/compress passes; pass k's blocks are exactly
-// what mode k*10000+n would output, so every pass is reported as its own
-// result. Block data holds the bits packed LSB-first (DEFLATE bit order) with
-// the BFINAL bit cleared.
+// A mode K*10000+n runs up to K+1 split/compress passes; pass k's blocks are
+// exactly what mode k*10000+n would output, so every pass is reported as its
+// own result. The run stops once the passes revisit an earlier state, since
+// every later pass would repeat an earlier result. Block data holds the bits
+// packed LSB-first (DEFLATE bit order) with the BFINAL bit cleared.
 import ECTZopfli from './ect-zopfli.mjs';
 
 const ready = ECTZopfli();
