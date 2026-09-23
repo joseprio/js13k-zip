@@ -4,8 +4,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import { parseArgs } from 'node:util';
-import { Worker } from 'node:worker_threads';
-import { PRESETS, isZip, optimize, recompressZip, variants } from './core.mjs';
+import { PRESETS, isZip, packHtml, recompress } from './node.mjs';
 
 const { values: opts, positionals } = parseArgs({
   allowPositionals: true,
@@ -27,7 +26,7 @@ const { values: opts, positionals } = parseArgs({
 });
 
 if (opts.help || positionals.length !== 1 || !PRESETS[opts.preset] || !['auto', 'yes', 'no'].includes(opts.bom)) {
-  console.error(`Usage: node cli.mjs <input.html | input.zip> [options]
+  console.error(`Usage: js13k-zip <input.html | input.zip> [options]   (or: node cli.mjs ...)
 
 A .zip input is recompressed: every file is extracted and packed again with
 the same name and exact contents (--bom and --name don't apply).
@@ -56,23 +55,12 @@ const zipInput = isZip(bytes);
 const out = opts.out || input.replace(/\.[^./\\]*$/, '') + (zipInput ? '.min.zip' : '.zip');
 const nWorkers = Math.max(1, parseInt(opts.workers, 10) || os.availableParallelism?.() || os.cpus().length);
 
-const workerUrl = new URL('./ect/worker.mjs', import.meta.url);
-const createWorker = () => {
-  const w = new Worker(workerUrl);
-  const waiting = new Map();
-  w.on('message', r => {
-    const resolve = waiting.get(r.id);
-    if (resolve) { waiting.delete(r.id); resolve(r); }
-  });
-  return { run: msg => new Promise(resolve => { waiting.set(msg.id, resolve); w.postMessage(msg); }), terminate: () => w.terminate() };
-};
-
 const t0 = performance.now();
 const secs = () => ((performance.now() - t0) / 1000).toFixed(1);
 const tty = process.stderr.isTTY && !opts.quiet;
 let prefix = '';
 const search = {
-  createWorker, workers: nWorkers, preset: opts.preset, timeLimit: +opts.time || 0, target: +opts.target || 0,
+  workers: nWorkers, preset: opts.preset, timeLimit: +opts.time || 0, target: +opts.target || 0,
   focus: +opts.focus, seedBase: parseInt(opts.seed, 10) || 0,
   fillCap: opts['fill-cap'] === undefined ? undefined : parseInt(opts['fill-cap'], 10) || 0,
   extra: opts.extra === undefined ? undefined : parseInt(opts.extra, 10) || 0,
@@ -84,8 +72,8 @@ const search = {
 
 try {
   if (zipInput) {
-    const res = await recompressZip({
-      ...search, zip: bytes,
+    const res = await recompress(bytes, {
+      ...search,
       onFile: f => {
         if (tty && f.index) process.stderr.write('\n');
         prefix = f.count > 1 ? `${f.name} (${f.index + 1}/${f.count}) ` : '';
@@ -102,8 +90,7 @@ try {
       console.log(`  ${secs()}s on ${nWorkers} workers; ${13312 - res.zip.length} bytes left of 13 KB`);
     }
   } else {
-    const inputs = variants(new TextDecoder().decode(bytes), opts.bom);
-    const res = await optimize({ ...search, inputs, filename: opts.name });
+    const res = await packHtml(bytes, { ...search, bom: opts.bom, filename: opts.name });
     if (tty) process.stderr.write('\n');
     fs.writeFileSync(out, res.zip);
     if (opts.quiet) {

@@ -1,0 +1,36 @@
+{
+  "name": "js13k-zip",
+  "version": "1.0.0",
+  "description": "Packs a js13kGames entry into the smallest ZIP it can find (ECT deflate search in WebAssembly), or recompresses an existing ZIP",
+  "keywords": ["js13k", "js13kgames", "zip", "deflate", "zopfli", "ect", "compression"],
+  "homepage": "https://joseprio.github.io/js13k-zip/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joseprio/js13k-zip.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "node": "./node.mjs",
+      "default": "./core.mjs"
+    },
+    "./core": "./core.mjs",
+    "./worker": "./ect/worker.mjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "js13k-zip": "cli.mjs"
+  },
+  "files": [
+    "cli.mjs",
+    "core.mjs",
+    "node.mjs",
+    "ect/ect-zopfli.mjs",
+    "ect/engine.mjs",
+    "ect/worker.mjs",
+    "ect/LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

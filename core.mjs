@@ -220,6 +220,12 @@ export function makeZip(filename, inflated, deflated) {
 }
 
 export async function inflateRaw(deflated) {
+  // Node's zlib works in every Node version; DecompressionStream only
+  // supports 'deflate-raw' from Node 20.
+  if (typeof process === 'object' && process.versions && process.versions.node) {
+    const { inflateRawSync } = await import('node:zlib');
+    return new Uint8Array(inflateRawSync(deflated));
+  }
   const stream = new Blob([deflated]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }

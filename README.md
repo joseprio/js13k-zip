@@ -51,7 +51,22 @@ ES modules), so to run it locally use any static server, e.g.
 
 ## Command line
 
-Needs a recent Node.js (tested with 24); no install step or dependencies.
+Needs Node.js 18 or newer; no dependencies. Run it from a clone with
+`node cli.mjs`, or add it to a project straight from GitHub:
+
+```sh
+npm install --save-dev github:joseprio/js13k-zip
+```
+
+which provides a `js13k-zip` command for npm scripts:
+
+```json
+"scripts": {
+  "zip": "js13k-zip dist/index.html -o dist/build.zip -p max"
+}
+```
+
+To pin a version, append a tag or commit: `github:joseprio/js13k-zip#<tag>`.
 
 ```sh
 node cli.mjs dist/index.html -o dist/entry.zip            # normal preset
@@ -80,12 +95,29 @@ Multi-file entries work too. Without `-o`, the result goes to `<input>.min.zip`.
 | `--name <file>` | file name inside the zip (default `index.html`; HTML input only) |
 | `-q, --quiet` | only print the final size |
 
-In a build script:
+## Node API
+
+Once installed, the same search is available from build scripts:
 
 ```js
-import { execFileSync } from 'node:child_process';
-execFileSync('node', ['../js13k-zip/cli.mjs', 'dist/index.html', '-o', 'dist/entry.zip', '-p', 'max'], { stdio: 'inherit' });
+import fs from 'node:fs';
+import { packHtml, recompress, packFile } from 'js13k-zip';
+
+// HTML string or bytes -> { zip, deflated, ... }
+const { zip } = await packHtml(fs.readFileSync('dist/index.html', 'utf8'), { preset: 'max' });
+fs.writeFileSync('dist/build.zip', zip);
+
+// Existing ZIP bytes -> { zip, files }
+const { zip: smaller } = await recompress(fs.readFileSync('dist/build.zip'));
+
+// File in, file out (HTML or ZIP, detected automatically)
+await packFile('dist/index.html', 'dist/build.zip', { preset: 'normal', timeLimit: 10 });
 ```
+
+Options mirror the CLI: `preset`, `timeLimit` (seconds), `target`, `extra`,
+`focus`, `seedBase`, `workers`, `onProgress`, and for HTML input `bom` and
+`filename`. The lower-level engine (`optimize`, `readZip`, `makeZipEntries`,
+...) is exported too, and on its own from `js13k-zip/core`.
 
 ## Presets
 
