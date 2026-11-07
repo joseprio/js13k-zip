@@ -15,37 +15,52 @@
 // already been in (see engine.mjs), so jobs are [n, K] pairs. Inputs that
 // don't converge drift instead: on a 37 KB bundle the best pass was always
 // k <= 4, so K stays small.
+// High mode bits recognized by ZopfliInitOptions (see ect/src/zopfli/util.c).
+export const MODE_NOSPLIT = 1 << 20;
+export const MODE_ENTROPY = 1 << 21;
+export const MODE_SPLIT3  = 1 << 22;
+
 export const PRESETS = {
   fast: { jobs: [[9, 2], [100, 2], [300, 2], [1000, 0]], seeds: 0 },
-  normal: { jobs: [9, 60, 100, 300, 500, 1000].map(n => [n, 4]), seeds: 2 },
+  normal: { jobs: [9, 100, 300, 500, 1000].map(n => [n, 4]), seeds: 2 },
   // max also completes 800 extra seed/range jobs: enough for every one of 6
   // seed streams to reach the best size found for galaxy-raid (11110 B).
-  max: { jobs: [9, 30, 60, 100, 150, 200, 300, 500, 1000].map(n => [n, 6]), seeds: 4, extra: 800 },
+  max: {
+    jobs: [...[9, 30, 100, 150, 200, 300, 500, 1000].map(n => [n, 6]), [9, 6, MODE_ENTROPY]],
+    seeds: 4,
+    extra: 800,
+  },
 };
 
 // Jobs re-run with extra seeds. Seeds only matter when ECT runs enough
 // iterations to hit its randomization step (level >= 7 or explicit iterations).
 // Picked by measured near-best results per CPU second on a roadrolled 15 KB
 // bundle; long jobs such as [1000, 10] were 5-10x less efficient.
-const SEED_JOBS = [[300, 2], [200, 1], [300, 1], [100, 4]];
+const SEED_JOBS = [[300, 2], [200, 1], [150, 1], [100, 4]];
+const BOUNDARY_DELTAS = [-16, 16, -32, 32, -8, 8, -64, 64, -4, 4, -2, 2, -1, 1];
 
+const baseMode = m => m & 0xfffff;
 // Iterations per pass for a level or explicit count (ECT's util.c table).
 const iterations = n => (n > 9 ? n : [1, 1, 1, 2, 3, 8, 13, 60, 60][Math.max(n, 2) - 1]);
 // Expected cost, for scheduling: runs rarely need more than ~5 passes.
-const jobCost = ({ mode }) => iterations(mode % 10000) * Math.min(5, 1 + Math.floor(mode / 10000));
+const jobCost = ({ mode }) => iterations(baseMode(mode) % 10000) * Math.min(5, 1 + Math.floor(baseMode(mode) / 10000));
 
-// Planned jobs for a preset: every [n, K] with the default seed, then `seeds`
-// extra seeds over SEED_JOBS; longest first so the workers finish together.
+// Planned jobs for a preset: every [n, K, flags] with the default seed, then
+// `seeds` extra seeds over SEED_JOBS; longest first so the workers finish together.
 export function planJobs(preset) {
   const { jobs, seeds } = PRESETS[preset];
-  const planned = jobs.map(([n, k]) => ({ mode: k * 10000 + n, seed: 0 }));
+  const planned = jobs.map(([n, k, flags = 0]) => ({ mode: flags | (k * 10000 + n), seed: 0 }));
   for (let s = 1; s <= seeds; s++) for (const [n, k] of SEED_JOBS) planned.push({ mode: k * 10000 + n, seed: s });
   return planned.sort((a, b) => jobCost(b) - jobCost(a));
 }
 
 // Endless stream of additional seed jobs, used while a time budget remains.
 export function* extraJobs(preset) {
-  for (let s = PRESETS[preset].seeds + 1; ; s++) for (const [n, k] of SEED_JOBS) yield { mode: k * 10000 + n, seed: s };
+  for (let s = PRESETS[preset].seeds + 1; ; s++) {
+    for (const [n, k] of SEED_JOBS) yield { mode: k * 10000 + n, seed: s };
+    if (s % 4 === 1) yield { mode: MODE_ENTROPY | (2 * 10000 + 9), seed: s };
+    else if (s % 4 === 2) yield { mode: MODE_SPLIT3 | (2 * 10000 + 9), seed: s };
+  }
 }
 
 // Runs mode K*10000+n with one task per block per pass, so a pass's blocks can
@@ -54,8 +69,9 @@ export function* extraJobs(preset) {
 // those of a sequential run, including stopping once the state between passes
 // repeats. runTask(msg) runs engine.passTask(bytes, msg); onPass(pass) gets
 // each finished pass ({ pass, mode, size, blocks }).
-export async function runChain({ mode, seed, start = 0, end, runTask, onPass, guess = 3 }) {
-  const K = Math.floor(mode / 10000);
+export async function runChain({ mode, seed, start = 0, end, runTask, onPass, guess = 1 }) {
+  const raw = baseMode(mode);
+  const K = Math.floor(raw / 10000);
   const seen = [];
   let prev = null;
   let costState = null;
@@ -63,25 +79,26 @@ export async function runChain({ mode, seed, start = 0, end, runTask, onPass, gu
     const twiceMode = K === 0 ? 0 : pass === 0 ? 1 : pass < K ? 3 : 2;
     const msg = block => ({ mode, seed, pass, twiceMode, prev, costState, block, start, end });
     const results = [];
+    const pending = [];
     let launched = 0;
-    let nblocks = guess;
-    const launch = async block => {
-      const r = await runTask(msg(block));
-      results[block] = r;
-      if (r.nblocks > launched) {
-        nblocks = r.nblocks;
-        const more = [];
-        while (launched < nblocks) more.push(launch(launched++));
-        await Promise.all(more);
+    let nblocks = (mode & MODE_NOSPLIT) ? 1 : (typeof guess === 'function' ? guess(pass) : guess);
+    const expand = target => {
+      if (target > nblocks) nblocks = target;
+      while (launched < nblocks) {
+        const b = launched++;
+        const p = runTask(msg(b)).then(r => {
+          results[b] = r;
+          if (r.nblocks > launched) expand(r.nblocks);
+        });
+        pending.push(p);
       }
     };
-    const first = [];
-    while (launched < nblocks) first.push(launch(launched++));
-    await Promise.all(first);
+    expand(nblocks);
+    while (pending.length) await Promise.all(pending.splice(0));
     nblocks = results[0].nblocks;
     const blocks = results.slice(0, nblocks).flatMap(r => r.blocks);
     const nbits = blocks.reduce((a, b) => a + b.nbits, 0);
-    onPass({ pass, mode: pass * 10000 + (mode % 10000), size: (nbits + 7) >> 3, blocks });
+    onPass({ pass, mode: (mode & ~0xfffff) | (pass * 10000 + (raw % 10000)), size: (nbits + 7) >> 3, blocks });
     guess = nblocks;
     if (pass === K) break;
     // State handed to the next pass: carried cost model + this pass's LZ77 data.
@@ -158,9 +175,30 @@ export function assemble(blocks) {
   const out = new Uint8Array((nbits + 7) >> 3);
   let pos = 0;
   blocks.forEach((b, k) => {
-    for (let i = 0; i < b.nbits; i++, pos++) {
-      const bit = i === 0 ? +(k === blocks.length - 1) : (b.data[i >> 3] >> (i & 7)) & 1;
-      if (bit) out[pos >> 3] |= 1 << (pos & 7);
+    const n = b.nbits;
+    if (!n) return;
+    const b0 = k === blocks.length - 1 ? (b.data[0] | 1) : (b.data[0] & ~1);
+    const fullBytes = n >> 3;
+    const shift = pos & 7;
+    const dstOff = pos >> 3;
+    if (fullBytes > 0) {
+      if (shift === 0) {
+        out[dstOff] = b0;
+        if (fullBytes > 1) out.set(b.data.subarray(1, fullBytes), dstOff + 1);
+      } else {
+        out[dstOff] |= (b0 << shift) & 0xff;
+        out[dstOff + 1] = b0 >>> (8 - shift);
+        for (let j = 1; j < fullBytes; j++) {
+          const v = b.data[j];
+          out[dstOff + j] |= (v << shift) & 0xff;
+          out[dstOff + j + 1] = v >>> (8 - shift);
+        }
+      }
+    }
+    pos += fullBytes << 3;
+    for (let i = fullBytes << 3; i < n; i++, pos++) {
+      const byte = i < 8 ? b0 : b.data[i >> 3];
+      if ((byte >>> (i & 7)) & 1) out[pos >> 3] |= 1 << (pos & 7);
     }
   });
   return out;
@@ -320,6 +358,7 @@ class Pool {
     this.queue = [];
     this.filler = null;
     this.fillCap = Infinity;
+    this.fillScheduled = false;
     this.closed = false;
     this.seq = 0;
     this.ids = 0;
@@ -363,16 +402,31 @@ class Pool {
       }
       this.start(worker, this.queue.shift());
     }
-    while (this.idle.length && this.filler && this.speculative() < this.fillCap) {
+    // Defer speculative filler work until pending microtasks (e.g. runChain's
+    // 3-hop pass continuation) have had a chance to submit high-priority tasks.
+    const limit = typeof this.fillCap === 'function' ? this.fillCap() : this.fillCap;
+    if (this.idle.length && this.filler && !this.fillScheduled && this.speculative() < limit) {
+      this.fillScheduled = true;
+      Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve()).then(() => {
+        this.fillScheduled = false;
+        this.pumpFiller();
+      });
+    }
+  }
+
+  pumpFiller() {
+    if (this.closed) return;
+    const limit = typeof this.fillCap === 'function' ? this.fillCap() : this.fillCap;
+    while (this.idle.length && !this.queue.length && this.filler && this.speculative() < limit) {
       const job = this.filler();
       if (!job) break;
-      this.start(this.idle.pop(), { prio: 0, msg: job.msg, resolve: job.onResult, reject: job.onDropped || (() => {}) });
+      this.start(this.idle.pop(), { prio: job.prio ?? 0, msg: job.msg, resolve: job.onResult, reject: job.onDropped || (() => {}) });
     }
   }
 
   speculative() {
     let n = 0;
-    for (const slot of this.running) if (slot.task.prio === 0) n++;
+    for (const slot of this.running) if (slot.task.prio < 1) n++;
     return n;
   }
 
@@ -431,9 +485,10 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
 
   const addPass = (v, pass, seed, whole) => {
     if (stopped) return;
+    const dispMode = baseMode(pass.mode);
     if (whole) {
-      runs.push({ mode: pass.mode, seed, variant: v.label, size: pass.size });
-      if (!bestSingle || pass.size < bestSingle.size) bestSingle = { mode: pass.mode, seed, variant: v.label, size: pass.size };
+      runs.push({ mode: dispMode, seed, variant: v.label, size: pass.size });
+      if (!bestSingle || pass.size < bestSingle.size) bestSingle = { mode: dispMode, seed, variant: v.label, size: pass.size };
     }
     if (!pools.get(v).add(pass.blocks)) return;
     const b = pools.get(v).best();
@@ -442,16 +497,74 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
     if (target && best.zipSize <= target) stop();
   };
 
-  // Speculative work for idle workers: range jobs (re-compress one block range
-  // of the current best chain; each range improves on its own at a fraction of
-  // a whole run's cost) mixed with whole-input seed jobs.
+  const retryExtra = [];
+  const pendingRanges = [];
+  const rangeTries = new Map();
+  const boundaryTries = new Map();
+
+  // Speculative work for idle workers: single-block range jobs (re-compressing
+  // individual blocks of the best chain, plus occasional merged adjacent pairs
+  // and perturbed split boundaries) mixed with whole-input seed jobs.
+  const targetRanges = Math.round(extraBudget * focus);
+  const tailRanges = Math.min(Math.max(0, workers - 1), targetRanges);
   const nextExtra = () => {
-    if (best && best.blocks.length > 1 && ++extraCount * focus >= rangeCount + 1) {
-      const k = rangeCount++;
-      const b = best.blocks[k % best.blocks.length];
-      const [n, K] = SEED_JOBS[Math.floor(k / best.blocks.length) % SEED_JOBS.length];
-      const seed = 1 + seedBase + Math.floor(k / (best.blocks.length * SEED_JOBS.length));
-      return { mode: K * 10000 + n, seed, v: best.v, start: b.start, end: b.end };
+    if (retryExtra.length) return retryExtra.shift();
+    const ec = ++extraCount;
+    let wantRange = ec * focus >= rangeCount + 1;
+    if (extraBudget > 0 && ec <= extraBudget) {
+      wantRange = ec > extraBudget - tailRanges
+        ? rangeCount < targetRanges
+        : ec * (targetRanges - tailRanges) >= (rangeCount + 1) * (extraBudget - tailRanges);
+    }
+    if (best && best.blocks.length > 1 && wantRange) {
+      const rc = rangeCount++;
+      if (!pendingRanges.length) {
+        const blks = best.blocks;
+        const v = best.v;
+        // Every 8th range slot, try an untried adjacent block merge or boundary shift.
+        if (rc % 8 === 7) {
+          for (let i = 0; i + 1 < blks.length; i++) {
+            const start = blks[i].start, end = blks[i + 1].end;
+            const mkey = `merge:${v.label}:${start}-${end}`;
+            if (!rangeTries.has(mkey)) {
+              rangeTries.set(mkey, 1);
+              pendingRanges.push({ mode: MODE_NOSPLIT | (1 * 10000 + 200), seed: 0, v, start, end });
+              break;
+            }
+          }
+          if (!pendingRanges.length) {
+            const bi = Math.floor(rc / 8) % (blks.length - 1);
+            const left = blks[bi], right = blks[bi + 1];
+            const bkey = `${v.label}:${left.start}:${left.end}:${right.end}`;
+            const di = boundaryTries.get(bkey) || 0;
+            if (di < BOUNDARY_DELTAS.length) {
+              boundaryTries.set(bkey, di + 1);
+              const mid = left.end + BOUNDARY_DELTAS[di];
+              if (mid > left.start + 32 && mid < right.end - 32) {
+                pendingRanges.push(
+                  { mode: MODE_NOSPLIT | (1 * 10000 + 200), seed: 0, v, start: left.start, end: mid },
+                  { mode: MODE_NOSPLIT | (1 * 10000 + 200), seed: 0, v, start: mid, end: right.end },
+                );
+              }
+            }
+          }
+        }
+        // Re-compress the least-tried block of best.blocks with the next (mode, seed).
+        if (!pendingRanges.length) {
+          let pick = blks[0], minT = Infinity;
+          for (const b of blks) {
+            const t = rangeTries.get(`${v.label}:${b.start}-${b.end}`) || 0;
+            if (t < minT) { minT = t; pick = b; }
+          }
+          const key = `${v.label}:${pick.start}-${pick.end}`;
+          const t = rangeTries.get(key) || 0;
+          rangeTries.set(key, t + 1);
+          const [n, K] = SEED_JOBS[t % SEED_JOBS.length];
+          const seed = 1 + seedBase + Math.floor(t / SEED_JOBS.length);
+          pendingRanges.push({ mode: MODE_NOSPLIT | (K * 10000 + n), seed, v, start: pick.start, end: pick.end });
+        }
+      }
+      return pendingRanges.shift();
     }
     if (!extraPending.length) {
       const j = extra.next().value;
@@ -461,36 +574,69 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
   };
 
   const pool = new Pool(createWorker, workers);
-  pool.fillCap = fillCap ?? (deadline || extraBudget ? Infinity : 0);
+  let activeChains = chains.length;
+  let maxPass0Blocks = 3;
+  pool.fillCap = fillCap ?? (deadline ? Infinity : extraBudget ? () => {
+    const reserve = (activeChains <= 2 ? activeChains > 0 ? 1 : 0 : activeChains) * maxPass0Blocks;
+    return Math.max(0, workers - reserve);
+  } : 0);
   const presetDone = () => plannedDone === chains.length;
   const allDone = () => presetDone() && extraDone >= extraBudget && (!deadline || Date.now() >= deadline);
   pool.filler = () => {
-    const wanted = extraDone + extraInFlight < extraBudget || !presetDone() || (deadline && Date.now() < deadline);
+    const wanted = extraDone + extraInFlight < extraBudget || (fillCap && !presetDone()) || (deadline && Date.now() < deadline);
     if (stopped || !wanted) return null;
+    const prio = extraDone + extraInFlight < extraBudget ? 0.5 : 0;
     const job = nextExtra();
     const whole = job.end === undefined;
     extraInFlight++;
     return {
+      prio,
       msg: { kind: 'deflate', bytes: job.v.bytes, mode: job.mode, seed: job.seed, start: job.start, end: job.end },
       onResult: r => {
         extraInFlight--;
         jobs++;
         extraDone++;
         for (const pass of r.passes) addPass(job.v, pass, job.seed, whole);
-        report(`-${job.mode} seed ${job.seed}` + (whole ? '' : ` bytes ${job.start}-${job.end}`));
+        report(`-${baseMode(job.mode)} seed ${job.seed}` + (whole ? '' : ` bytes ${job.start}-${job.end}`));
         if (allDone()) stop();
       },
-      onDropped: () => { extraInFlight--; },
+      onDropped: () => { extraInFlight--; retryExtra.unshift(job); },
     };
   };
 
+  // Pass 0's block split depends only on the variant and the high split flags.
+  // Probe each group once with block = -2 (only runs ZopfliBlockSplit, ~2ms)
+  // before dispatching the chains so every chain starts Pass 0 with its exact
+  // block count and the longest chains immediately claim all their block slots.
+  const pass0Split = new Map();
+  const probes = [];
+  for (const job of chains) {
+    if (job.mode & MODE_NOSPLIT) continue;
+    const splitKey = `${job.v.label}:${job.mode & ~0xfffff}`;
+    if (pass0Split.has(splitKey)) continue;
+    pass0Split.set(splitKey, 1);
+    probes.push(pool.submit({
+      kind: 'task', bytes: job.v.bytes, mode: job.mode, seed: 0,
+      pass: 0, twiceMode: 1, prev: null, costState: null, block: -2,
+      start: 0, end: job.v.bytes.length,
+    }, 10).then(r => {
+      pass0Split.set(splitKey, r.task.nblocks);
+    }));
+  }
+  await Promise.all(probes);
+  maxPass0Blocks = Math.max(1, ...pass0Split.values());
+
   // The preset: every job as a chain of per-block tasks, longest chains first.
-  const chainRuns = chains.map(job => runChain({
-    mode: job.mode, seed: job.seed, end: job.v.bytes.length,
-    runTask: msg => pool.submit({ kind: 'task', bytes: job.v.bytes, ...msg }, 1 + jobCost(job) / maxCost)
-      .then(r => { jobs++; return r.task; }),
-    onPass: pass => { addPass(job.v, pass, job.seed, true); report(`-${pass.mode} seed ${job.seed}`); },
-  }).then(() => { plannedDone++; }));
+  const chainRuns = chains.map(job => {
+    const splitKey = `${job.v.label}:${job.mode & ~0xfffff}`;
+    return runChain({
+      mode: job.mode, seed: job.seed, end: job.v.bytes.length,
+      guess: pass0Split.get(splitKey) || 1,
+      runTask: msg => pool.submit({ kind: 'task', bytes: job.v.bytes, ...msg }, 1 + jobCost(job) / maxCost)
+        .then(r => { jobs++; return r.task; }),
+      onPass: pass => { addPass(job.v, pass, job.seed, true); report(`-${baseMode(pass.mode)} seed ${job.seed}`); },
+    }).then(() => { activeChains--; plannedDone++; pool.pump(); });
+  });
 
   // The preset always completes; a time limit only bounds the extra search.
   if (deadline) setTimeout(() => { if (allDone()) stop(); }, Math.max(0, deadline - Date.now()));

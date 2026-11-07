@@ -9,7 +9,17 @@ import ECTZopfli from './ect-zopfli.mjs';
 function extractBits(src, from, to) {
   const n = to - from;
   const out = new Uint8Array((n + 7) >> 3);
-  for (let i = 0; i < n; i++) {
+  const byteOff = from >> 3;
+  const shift = from & 7;
+  const fullBytes = n >> 3;
+  if (shift === 0) {
+    out.set(src.subarray(byteOff, byteOff + fullBytes));
+  } else {
+    for (let j = 0; j < fullBytes; j++) {
+      out[j] = (src[byteOff + j] >>> shift) | (src[byteOff + j + 1] << (8 - shift));
+    }
+  }
+  for (let i = fullBytes << 3; i < n; i++) {
     const b = from + i;
     if ((src[b >> 3] >> (b & 7)) & 1) out[i >> 3] |= 1 << (i & 7);
   }
@@ -50,7 +60,7 @@ export async function createEngine() {
       const [start, end, bitstart, bitend, pass] = rec.subarray(i * 5, i * 5 + 5);
       const data = extractBits(out, bitstart, bitend);
       data[0] &= ~1;
-      passes[pass] ||= { pass, mode: pass * 10000 + (mode % 10000), nbits: 0, blocks: [] };
+      passes[pass] ||= { pass, mode: (mode & ~0xfffff) | (pass * 10000 + ((mode & 0xfffff) % 10000)), nbits: 0, blocks: [] };
       passes[pass].nbits += bitend - bitstart;
       passes[pass].blocks.push({ start, end, nbits: bitend - bitstart, data });
     }

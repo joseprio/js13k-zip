@@ -152,6 +152,7 @@ pack1.onclick = async () => {
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
       progressBar.value = 100;
       statusText.innerText = `Done in ${secs}s`;
+      if (dl1.href.startsWith('blob:')) URL.revokeObjectURL(dl1.href);
       dl1.href = URL.createObjectURL(new Blob([res.zip], { type: 'application/zip' }));
       dl1.innerText = `Download entry.zip (${res.zip.length} bytes)`;
       const diff = res.zip.length - zipInput.bytes.length;
@@ -171,6 +172,7 @@ pack1.onclick = async () => {
     progressBar.value = 100;
     statusText.innerText = `Done in ${secs}s`;
 
+    if (dl1.href.startsWith('blob:')) URL.revokeObjectURL(dl1.href);
     const url = URL.createObjectURL(new Blob([res.zip], { type: 'application/zip' }));
     dl1.href = url;
     dl1.innerText = `Download entry.zip (${res.zip.length} bytes)`;

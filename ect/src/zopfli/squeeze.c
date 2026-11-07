@@ -226,57 +226,24 @@ static void GetBestLengths2(const unsigned char* in, size_t instart, size_t inen
 
   /*TODO: Put this in seperate function*/
   float litlentable [259];
-  float* disttable = (float*)malloc(ZOPFLI_WINDOW_SIZE * sizeof(float));
+  float disttable[ZOPFLI_WINDOW_SIZE];
   float* literals = costcontext->ll_symbols;
-  if (!disttable){
-    exit(1);
+  size_t maxd = inend < ZOPFLI_WINDOW_SIZE ? inend + 1 : ZOPFLI_WINDOW_SIZE;
+  size_t cap = maxd < 1025 ? maxd : 1025;
+  for (i = 3; i < 259; i++){
+    litlentable[i] = costcontext->ll_symbols[ZopfliGetLengthSymbol(i)] + ZopfliGetLengthExtraBits(i);
   }
-    for (i = 3; i < 259; i++){
-      litlentable[i] = costcontext->ll_symbols[ZopfliGetLengthSymbol(i)] + ZopfliGetLengthExtraBits(i);
+  for (i = 0; i < cap; i++){
+    disttable[i] = costcontext->d_symbols[ZopfliGetDistSymbol(i)] + ZopfliGetDistExtraBits(i);
+  }
+  if (maxd > 1025) {
+    static const unsigned short bounds[10] = {1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 32768};
+    for (unsigned b = 0; b < 10 && i < maxd; b++) {
+      float counter = costcontext->d_symbols[20 + b] + (9 + (b >> 1));
+      size_t end = bounds[b] < maxd ? bounds[b] : maxd;
+      for (; i < end; i++) disttable[i] = counter;
     }
-    for (i = 0; i < 1025; i++){
-      disttable[i] = costcontext->d_symbols[ZopfliGetDistSymbol(i)] + ZopfliGetDistExtraBits(i);
-    }
-    float counter = costcontext->d_symbols[20] + 9;
-    for (; i < 1537; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[21] + 9;
-    for (; i < 2049; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[22] + 10;
-    for (; i < 3073; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[23] + 10;
-    for (; i < 4097; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[24] + 11;
-    for (; i < 6145; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[25] + 11;
-    for (; i < 8193; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[26] + 12;
-    for (; i < 12289; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[27] + 12;
-    for (; i < 16385; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[28] + 13;
-    for (; i < 24577; i++){
-      disttable[i] = counter;
-    }
-    counter = costcontext->d_symbols[29] + 13;
-    for (; i < 32768; i++){
-      disttable[i] = counter;
-    }
+  }
 
   size_t blocksize = inend - instart;
 
@@ -374,7 +341,6 @@ static void GetBestLengths2(const unsigned char* in, size_t instart, size_t inen
 
   c->pointer = 0;
 
-  free(disttable);
   free(costs);
 }
 

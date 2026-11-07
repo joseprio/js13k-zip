@@ -211,6 +211,8 @@ static const ZopfliOptionsMin opt[8] =
 };
 
 void ZopfliInitOptions(ZopfliOptions* options, unsigned _mode, unsigned multithreading, unsigned isPNG) {
+  unsigned flags = _mode & ~0xfffffu;
+  _mode &= 0xfffffu;
   options->twice = (_mode - (_mode % 10000)) / 10000;
   unsigned mode = _mode % 10000 > 9 ? 9 : _mode % 10000;
   if (mode < 2){
@@ -240,4 +242,9 @@ void ZopfliInitOptions(ZopfliOptions* options, unsigned _mode, unsigned multithr
   options->entropysplit = mode < 3;
   options->greed = isPNG ? mode > 3 ? 258 : 50 : 258;
   options->advanced = mode >= 5;
+  /* js13k-zip: high mode bits override block-splitting parameters while
+     preserving mode 9 LZ77/Huffman settings. */
+  if (flags & (1u << 20)) options->noblocksplit = ~(size_t)0;
+  if (flags & (1u << 21)) options->entropysplit = 1;
+  if (flags & (1u << 22)) options->num = 3;
 }

@@ -24,13 +24,14 @@ static inline const unsigned char* GetMatch(const unsigned char* scan,
                                             , const unsigned char* safe_end) {
 #if defined(__GNUC__)
   /* Optimized Function based on cloudflare's zlib fork.*/
-  if (sizeof(size_t) == 8) {
+  if (sizeof(size_t) == 8 || sizeof(unsigned long long) == 8) {
+    typedef unsigned long long u64_unaligned __attribute__((aligned(1)));
     do {
-      size_t sv = *(size_t*)(void*)scan;
-      size_t mv = *(size_t*)(void*)match;
-      size_t xor = sv ^ mv;
-      if (xor) {
-        scan += __builtin_ctzll(xor) / 8;
+      unsigned long long sv = *(const u64_unaligned*)(const void*)scan;
+      unsigned long long mv = *(const u64_unaligned*)(const void*)match;
+      unsigned long long xor_v = sv ^ mv;
+      if (xor_v) {
+        scan += __builtin_ctzll(xor_v) >> 3;
         break;
       }
       scan += 8;
