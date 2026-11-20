@@ -97,6 +97,14 @@ void EctDeflatePassTask(const ZopfliOptions* options, const unsigned char* in,
                         const unsigned short* litlens, const unsigned short* dists, size_t size,
                         unsigned char* bp, unsigned char** out, size_t* outsize);
 
+/* js13k-zip: post-search exact polish of a single DEFLATE block [instart, inend).
+   Runs joint fixed-point all-distance DP + Kraft-preserving Huffman tree
+   hill-climbing + DP tree-header RLE + rare-symbol elimination. Returns 1 and
+   emits the polished block (bfinal=0) if strictly smaller than orig_nbits. */
+int EctPolishBlock(const unsigned char* in, size_t instart, size_t inend,
+                   const unsigned char* orig_block, size_t orig_nbits,
+                   unsigned char* bp, unsigned char** out, size_t* outsize);
+
 size_t GetDynamicLengths2(unsigned* ll_lengths, unsigned* d_lengths, const size_t* ll_counts, const size_t* d_counts);
 #ifdef __cplusplus
 }  // extern "C"

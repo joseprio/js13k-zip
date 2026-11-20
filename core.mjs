@@ -125,6 +125,7 @@ export class BlockPool {
   constructor(length) {
     this.length = length;
     this.ranges = new Map(); // "start-end" -> smallest block
+    this.top = new Map();    // "start-end" -> up to 3 distinct smallest blocks
   }
 
   // Returns true if any range got a smaller encoding.
@@ -137,8 +138,26 @@ export class BlockPool {
         this.ranges.set(key, b);
         improved = true;
       }
+      let list = this.top.get(key);
+      if (!list) {
+        this.top.set(key, [b]);
+      } else if (list.length < 3 || b.nbits < list[list.length - 1].nbits) {
+        const same = list.some(x => x.nbits === b.nbits && x.data.length === b.data.length
+          && x.data[0] === b.data[0] && x.data[x.data.length >> 1] === b.data[b.data.length >> 1]
+          && x.data[x.data.length - 1] === b.data[b.data.length - 1]);
+        if (!same) {
+          list.push(b);
+          list.sort((x, y) => x.nbits - y.nbits);
+          if (list.length > 3) list.length = 3;
+        }
+      }
     }
     return improved;
+  }
+
+  candidates(start, end, limit = 2) {
+    const list = this.top.get(start + '-' + end);
+    return list ? list.slice(0, limit) : [];
   }
 
   // Cheapest chain of blocks covering [0, length): { nbits, blocks }.
@@ -521,19 +540,23 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
       if (!pendingRanges.length) {
         const blks = best.blocks;
         const v = best.v;
-        // Every 8th range slot, try an untried adjacent block merge or boundary shift.
-        if (rc % 8 === 7) {
-          for (let i = 0; i + 1 < blks.length; i++) {
-            const start = blks[i].start, end = blks[i + 1].end;
-            const mkey = `merge:${v.label}:${start}-${end}`;
-            if (!rangeTries.has(mkey)) {
-              rangeTries.set(mkey, 1);
-              pendingRanges.push({ mode: MODE_NOSPLIT | (1 * 10000 + 200), seed: 0, v, start, end });
-              break;
+        // Every 6th range slot, alternate between an untried adjacent block merge
+        // and a split-boundary perturbation so both are explored early.
+        if (rc % 6 === 5) {
+          const slot = Math.floor(rc / 6);
+          const tryMerge = () => {
+            for (let i = 0; i + 1 < blks.length; i++) {
+              const start = blks[i].start, end = blks[i + 1].end;
+              const mkey = `merge:${v.label}:${start}-${end}`;
+              if (!rangeTries.has(mkey)) {
+                rangeTries.set(mkey, 1);
+                pendingRanges.push({ mode: MODE_NOSPLIT | (1 * 10000 + 200), seed: 0, v, start, end });
+                break;
+              }
             }
-          }
-          if (!pendingRanges.length) {
-            const bi = Math.floor(rc / 8) % (blks.length - 1);
+          };
+          const tryBoundary = () => {
+            const bi = Math.floor(slot / 2) % (blks.length - 1);
             const left = blks[bi], right = blks[bi + 1];
             const bkey = `${v.label}:${left.start}:${left.end}:${right.end}`;
             const di = boundaryTries.get(bkey) || 0;
@@ -547,7 +570,9 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
                 );
               }
             }
-          }
+          };
+          if (slot % 2 === 0) { tryMerge(); if (!pendingRanges.length) tryBoundary(); }
+          else { tryBoundary(); if (!pendingRanges.length) tryMerge(); }
         }
         // Re-compress the least-tried block of best.blocks with the next (mode, seed).
         if (!pendingRanges.length) {
@@ -645,6 +670,43 @@ export async function optimize({ inputs, createWorker, workers = 4, preset = 'no
     e => { failure = e; stop(); });
   pool.pump();
   await finished;
+  // Exact post-search polish of the winning blocks in parallel on the pool
+  // (joint all-distance DP + Kraft tree hill-climb + DP header + symbol elim).
+  if (!failure && best && !(target && best.zipSize <= target)) {
+    pool.filler = null;
+    try {
+      const toPolish = [];
+      for (const v of inputs) {
+        const bp = pools.get(v);
+        const b = bp.best();
+        if (!b) continue;
+        const z = 98 + 2 * filename.length + ((b.nbits + 7) >> 3);
+        if (v === best.v || z <= best.zipSize + 8) {
+          const perBlock = b.blocks.length <= 4 ? 3 : 2;
+          for (const blk of b.blocks) {
+            for (const cand of bp.candidates(blk.start, blk.end, perBlock)) {
+              toPolish.push({ v, blk: cand });
+            }
+          }
+        }
+      }
+      const polished = await Promise.all(toPolish.map(({ v, blk }) =>
+        pool.submit({ kind: 'polish', bytes: v.bytes, block: blk }, 20)
+          .then(r => ({ v, block: r.block }))));
+      for (const { v, block } of polished) {
+        if (pools.get(v).add([block])) {
+          const b = pools.get(v).best();
+          const zipSize = 98 + 2 * filename.length + ((b.nbits + 7) >> 3);
+          if (zipSize < best.zipSize || (zipSize === best.zipSize && b.nbits < best.nbits)) {
+            best = { ...b, v, zipSize };
+          }
+        }
+      }
+      report('polish');
+    } catch (e) {
+      failure = e;
+    }
+  }
   pool.close();
   if (failure) throw failure;
 

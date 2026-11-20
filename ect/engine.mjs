@@ -107,5 +107,21 @@ export async function createEngine() {
         }
       });
     },
+
+    // Exact post-search polish of a single DEFLATE block { start, end, nbits, data }.
+    // Returns the polished block if strictly smaller, otherwise the original block.
+    polishBlock(bytes, block) {
+      return withInput(bytes, p => {
+        const bp = copyIn(block.data);
+        try {
+          const size = M._ect_polish_block(p, block.start, block.end, bp, block.nbits);
+          if (!size) return block;
+          const passes = readPasses(size, 0);
+          return passes.length && passes[0].blocks.length ? passes[0].blocks[0] : block;
+        } finally {
+          if (bp) M._free(bp);
+        }
+      });
+    },
   };
 }

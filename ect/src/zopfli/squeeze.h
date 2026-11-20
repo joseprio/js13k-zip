@@ -50,9 +50,23 @@ typedef struct SymbolStats {
 } SymbolStats;
 
   typedef struct iSymbolStats {
-    unsigned char ll_symbols[288];  /* Length of each lit/len symbol in bits. */
-    unsigned char d_symbols[32];  /* Length of each dist symbol in bits. */
+    unsigned short ll_symbols[288];  /* Length of each lit/len symbol in bits. */
+    unsigned short d_symbols[32];  /* Length of each dist symbol in bits. */
   } iSymbolStats;
+
+typedef struct EctUltraMatchCache {
+  unsigned short* pairs;   /* flat array of (len, dist) pairs, <= 1 per dist sym */
+  unsigned* offsets;       /* blocksize + 1 offsets into pairs */
+  size_t blocksize;
+} EctUltraMatchCache;
+
+void EctBuildAllMatches(const unsigned char* in, size_t instart, size_t inend,
+                        unsigned max_steps, EctUltraMatchCache* cache);
+void EctFreeAllMatches(EctUltraMatchCache* cache);
+void EctRunAllDistDP(const unsigned char* in, size_t instart, size_t inend,
+                     const EctUltraMatchCache* cache,
+                     const unsigned short* ll_cost, const unsigned short* d_cost,
+                     ZopfliLZ77Store* store);
 
 void GetStatistics(const ZopfliLZ77Store* store, SymbolStats* stats);
 

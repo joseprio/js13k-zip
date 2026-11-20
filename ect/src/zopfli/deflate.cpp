@@ -359,6 +359,226 @@ size_t CalculateTreeSize(const unsigned* ll_lengths,
   return EncodeTree(ll_lengths, d_lengths, 1, 1, 1, 0, 0, 0, 0, 0);
 }
 
+/* js13k-zip: fast zero-allocation greedy tree size for hill-climbing inner loops. */
+static size_t FastTreeSizeNoAlloc(const unsigned* ll_lengths, const unsigned* d_lengths) {
+  static const unsigned order[19] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+  };
+  unsigned hlit = 29;
+  unsigned hdist = 29;
+  while (hlit && ll_lengths[257 + hlit - 1] == 0) hlit--;
+  while (hdist && d_lengths[hdist] == 0) hdist--;
+  unsigned hlit2 = hlit + 257;
+  unsigned lld_total = hlit2 + hdist + 1;
+  size_t clcounts[19] = {0};
+  for (unsigned i = 0; i < lld_total; i++) {
+    unsigned sym = i < hlit2 ? ll_lengths[i] : d_lengths[i - hlit2];
+    unsigned count = 1;
+    while (i + 1 < lld_total && (i + 1 < hlit2 ? ll_lengths[i + 1] : d_lengths[i + 1 - hlit2]) == sym) {
+      count++;
+      i++;
+    }
+    if (sym == 0 && count >= 3) {
+      while (count >= 11) { unsigned c2 = count > 138 ? 138 : count; clcounts[18]++; count -= c2; }
+      while (count >= 3)  { unsigned c2 = count > 10 ? 10 : count; clcounts[17]++; count -= c2; }
+    }
+    if (count >= 4) {
+      count--;
+      clcounts[sym]++;
+      while (count >= 3) {
+        if (count == 8 || count == 7) { clcounts[16] += 2; count = 0; }
+        else { unsigned c2 = count > 6 ? 6 : count; clcounts[16]++; count -= c2; }
+      }
+    }
+    clcounts[sym] += count;
+  }
+  unsigned clcl[19];
+  ZopfliLengthLimitedCodeLengths(clcounts, 19, 7, clcl);
+  unsigned hclen = 15;
+  while (hclen && clcounts[order[hclen + 4 - 1]] == 0) hclen--;
+  size_t bits = 14 + (hclen + 4) * 3;
+  for (unsigned i = 0; i < 19; i++) bits += clcl[i] * clcounts[i];
+  bits += clcounts[16] * 2 + clcounts[17] * 3 + clcounts[18] * 7;
+  return bits;
+}
+
+/* js13k-zip: exact DP-optimal RLE encoding of the dynamic Huffman tree header,
+   iterated over CLCL bitlengths across all 8 {16,17,18} subsets and CLCL
+   length limits 7..4. If out != 0, emits the winning header directly. */
+static size_t EncodeTreeDP(const unsigned* ll_lengths,
+                           unsigned* d_lengths,
+                           unsigned char* bp,
+                           unsigned char* out, size_t* outsize) {
+  static const unsigned order[19] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+  };
+  PatchDistanceCodesForBuggyDecoders(d_lengths);
+
+  unsigned hlit = 29;
+  unsigned hdist = 29;
+  while (hlit && ll_lengths[257 + hlit - 1] == 0) hlit--;
+  while (hdist && d_lengths[hdist] == 0) hdist--;
+  unsigned hlit2 = hlit + 257;
+  unsigned N = hlit2 + hdist + 1;
+
+  unsigned char seq[316];
+  for (unsigned i = 0; i < hlit2; i++) seq[i] = (unsigned char)ll_lengths[i];
+  for (unsigned i = 0; i <= hdist; i++) seq[hlit2 + i] = (unsigned char)d_lengths[i];
+
+  size_t best_bits = ~(size_t)0;
+  unsigned best_clcl[19] = {0};
+  unsigned best_hclen = 0;
+  unsigned char best_ops_s[316];
+  unsigned char best_ops_e[316];
+  unsigned best_nops = 0;
+
+  int dp[317];
+  unsigned short parent[317];
+  unsigned char sym_used[317];
+  unsigned char ex_used[317];
+  unsigned char ops_s[316];
+  unsigned char ops_e[316];
+
+  for (unsigned mask = 0; mask < 8; mask++) {
+    int use16 = mask & 1;
+    int use17 = mask & 2;
+    int use18 = mask & 4;
+    int cost[19];
+    for (int k = 0; k < 16; k++) cost[k] = 7; /* 3.5 * 2 */
+    cost[16] = use16 ? 6 : 1000000;
+    cost[17] = use17 ? 7 : 1000000;
+    cost[18] = use18 ? 8 : 1000000;
+
+    for (int it = 0; it < 3; it++) {
+      dp[0] = 0;
+      for (unsigned i = 1; i <= N; i++) dp[i] = 100000000;
+
+      for (unsigned i = 0; i < N; i++) {
+        int base = dp[i];
+        if (base >= 100000000) continue;
+        unsigned char s = seq[i];
+        int c1 = base + cost[s];
+        if (c1 < dp[i + 1]) {
+          dp[i + 1] = c1;
+          parent[i + 1] = (unsigned short)i;
+          sym_used[i + 1] = s;
+          ex_used[i + 1] = 0;
+        }
+        if (i > 0 && use16) {
+          unsigned char prev = seq[i - 1];
+          unsigned run = 0;
+          while (run < 6 && i + run < N && seq[i + run] == prev) run++;
+          int c16 = base + cost[16] + 4; /* 2 extra bits * 2 */
+          for (unsigned k = 3; k <= run; k++) {
+            if (c16 < dp[i + k]) {
+              dp[i + k] = c16;
+              parent[i + k] = (unsigned short)i;
+              sym_used[i + k] = 16;
+              ex_used[i + k] = (unsigned char)(k - 3);
+            }
+          }
+        }
+        if (s == 0 && (use17 || use18)) {
+          unsigned zrun = 0;
+          unsigned zlim = use18 ? 138 : 10;
+          while (zrun < zlim && i + zrun < N && seq[i + zrun] == 0) zrun++;
+          if (use17) {
+            unsigned lim = zrun < 10 ? zrun : 10;
+            int c17 = base + cost[17] + 6; /* 3 extra bits * 2 */
+            for (unsigned k = 3; k <= lim; k++) {
+              if (c17 < dp[i + k]) {
+                dp[i + k] = c17;
+                parent[i + k] = (unsigned short)i;
+                sym_used[i + k] = 17;
+                ex_used[i + k] = (unsigned char)(k - 3);
+              }
+            }
+          }
+          if (use18 && zrun >= 11) {
+            int c18 = base + cost[18] + 14; /* 7 extra bits * 2 */
+            for (unsigned k = 11; k <= zrun; k++) {
+              if (c18 < dp[i + k]) {
+                dp[i + k] = c18;
+                parent[i + k] = (unsigned short)i;
+                sym_used[i + k] = 18;
+                ex_used[i + k] = (unsigned char)(k - 11);
+              }
+            }
+          }
+        }
+      }
+
+      /* Reconstruct forward RLE op list and count frequencies. */
+      unsigned nops = 0;
+      size_t clcounts[19] = {0};
+      for (unsigned p = N; p > 0; p = parent[p]) {
+        ops_s[nops] = sym_used[p];
+        ops_e[nops] = ex_used[p];
+        clcounts[sym_used[p]]++;
+        nops++;
+      }
+      unsigned used_cl = 0;
+      for (int k = 0; k < 19; k++) if (clcounts[k]) used_cl++;
+      unsigned hclen = 15;
+      while (hclen && clcounts[order[hclen + 4 - 1]] == 0) hclen--;
+
+      size_t iter_best = ~(size_t)0;
+      unsigned iter_clcl[19] = {0};
+      for (int mb = 7; mb >= 4; mb--) {
+        if ((1u << mb) < used_cl) break;
+        unsigned clcl[19];
+        ZopfliLengthLimitedCodeLengths(clcounts, 19, mb, clcl);
+        size_t bits = 14 + (hclen + 4) * 3;
+        for (int k = 0; k < 19; k++) bits += clcl[k] * clcounts[k];
+        bits += clcounts[16] * 2 + clcounts[17] * 3 + clcounts[18] * 7;
+        if (bits < iter_best) {
+          iter_best = bits;
+          memcpy(iter_clcl, clcl, sizeof(clcl));
+        }
+      }
+
+      if (iter_best < best_bits) {
+        best_bits = iter_best;
+        memcpy(best_clcl, iter_clcl, sizeof(best_clcl));
+        best_hclen = hclen;
+        best_nops = nops;
+        for (unsigned i = 0; i < nops; i++) {
+          best_ops_s[i] = ops_s[nops - 1 - i];
+          best_ops_e[i] = ops_e[nops - 1 - i];
+        }
+      }
+
+      int changed = 0;
+      for (int k = 0; k < 19; k++) {
+        int nc;
+        if ((k == 16 && !use16) || (k == 17 && !use17) || (k == 18 && !use18)) nc = 1000000;
+        else nc = iter_clcl[k] ? (int)(iter_clcl[k] * 2) : 16;
+        if (nc != cost[k]) { cost[k] = nc; changed = 1; }
+      }
+      if (!changed) break;
+    }
+  }
+
+  if (out) {
+    unsigned clsymbols[19];
+    ZopfliLengthsToSymbols(best_clcl, 19, 7, clsymbols);
+    AddBits(hlit, 5, bp, out, outsize);
+    AddBits(hdist, 5, bp, out, outsize);
+    AddBits(best_hclen, 4, bp, out, outsize);
+    for (unsigned i = 0; i < best_hclen + 4; i++) {
+      AddBits(best_clcl[order[i]], 3, bp, out, outsize);
+    }
+    for (unsigned i = 0; i < best_nops; i++) {
+      unsigned s = best_ops_s[i];
+      AddHuffmanBits(clsymbols[s], best_clcl[s], bp, out, outsize);
+      if (s == 16) AddBits(best_ops_e[i], 2, bp, out, outsize);
+      else if (s == 17) AddBits(best_ops_e[i], 3, bp, out, outsize);
+      else if (s == 18) AddBits(best_ops_e[i], 7, bp, out, outsize);
+    }
+  }
+  return best_bits;
+}
+
 /*
 Adds all lit/len and dist codes from the lists as huffman symbols. Does not add
 end code 256. expected_data_size is the uncompressed block size, used for
@@ -679,6 +899,270 @@ static size_t CalculateBlockSymbolSize(const size_t* ll_counts, const size_t* d_
   }
   return result;
 }
+/* js13k-zip: Kraft-preserving Huffman code-length hill-climbing.
+   Modifies (ll_lengths, d_lengths) in place to minimize DataBits + TreeBits
+   while preserving exact Kraft sum == 1 and valid DEFLATE code lengths 1..15.
+   Returns exact total bits (DataBits + EncodeTreeDP bits) and sets *out_data. */
+static size_t OptimizeCodeLengthsHillClimb(const size_t* ll_counts,
+                                           const size_t* d_counts,
+                                           unsigned* ll_lengths,
+                                           unsigned* d_lengths,
+                                           int thorough,
+                                           size_t* out_data) {
+  unsigned used_ll_idx[286];
+  unsigned used_d_idx[30];
+  unsigned n_ll = 0, n_d = 0;
+  for (unsigned i = 0; i < 286; i++) if (ll_counts[i]) used_ll_idx[n_ll++] = i;
+  for (unsigned i = 0; i < 30; i++) if (d_counts[i]) used_d_idx[n_d++] = i;
+
+  PatchDistanceCodesForBuggyDecoders(d_lengths);
+
+  unsigned best_ll[288], best_d[32];
+  memcpy(best_ll, ll_lengths, sizeof(best_ll));
+  memcpy(best_d, d_lengths, sizeof(best_d));
+  size_t best_data = CalculateBlockSymbolSize(ll_counts, d_counts, best_ll, best_d);
+  size_t best_dp_total = best_data + EncodeTreeDP(best_ll, best_d, 0, 0, 0);
+
+  size_t cur_data = best_data;
+  size_t cur_fast = cur_data + FastTreeSizeNoAlloc(ll_lengths, d_lengths);
+
+  /* 1. Independent (maxLL, maxD) search on raw symbol counts. */
+  {
+    unsigned ll_cand[7][288];
+    unsigned d_cand[11][32];
+    int ll_ok[7] = {0}, d_ok[11] = {0};
+    for (int m = 0; m < 7; m++) {
+      unsigned mLL = (unsigned)(15 - m);
+      if ((1u << mLL) < n_ll) break;
+      ZopfliLengthLimitedCodeLengths(ll_counts, 288, mLL, ll_cand[m]);
+      ll_ok[m] = 1;
+    }
+    for (int m = 0; m < 11; m++) {
+      unsigned mD = (unsigned)(15 - m);
+      if (n_d > 0 && (1u << mD) < n_d) break;
+      ZopfliLengthLimitedCodeLengths(d_counts, 32, mD, d_cand[m]);
+      PatchDistanceCodesForBuggyDecoders(d_cand[m]);
+      d_ok[m] = 1;
+    }
+    for (int a = 0; a < 7 && ll_ok[a]; a++) {
+      for (int b = 0; b < 11 && d_ok[b]; b++) {
+        size_t db = CalculateBlockSymbolSize(ll_counts, d_counts, ll_cand[a], d_cand[b]);
+        if (db + 64 >= cur_fast) continue;
+        size_t tot = db + FastTreeSizeNoAlloc(ll_cand[a], d_cand[b]);
+        if (tot < cur_fast) {
+          cur_fast = tot;
+          cur_data = db;
+          memcpy(ll_lengths, ll_cand[a], sizeof(unsigned) * 288);
+          memcpy(d_lengths, d_cand[b], sizeof(unsigned) * 32);
+        }
+      }
+    }
+  }
+
+  /* 2. Kraft-preserving hill-climbing: pairwise swaps + (if thorough) 3-symbol moves. */
+  int max_rounds = thorough ? 5 : 2;
+  long max_ddata = thorough ? 18 : 16;
+
+  for (int round = 0; round < max_rounds; round++) {
+    int improved = 0;
+    for (int kind = 0; kind < 2; kind++) {
+      if (kind == 1 && n_d < 2) continue;
+      unsigned* arr = kind == 0 ? ll_lengths : d_lengths;
+      const size_t* cnts = kind == 0 ? ll_counts : d_counts;
+      unsigned* used = kind == 0 ? used_ll_idx : used_d_idx;
+      unsigned nu = kind == 0 ? n_ll : n_d;
+      unsigned arr_len = kind == 0 ? 286 : 30;
+
+      unsigned len_freq[16] = {0};
+      for (unsigned u = 0; u < nu; u++) len_freq[arr[used[u]]]++;
+
+      /* 2a. Pairwise swaps: L[i] <-> L[j] (exact Kraft delta = 0).
+         A swap preserves the length multiset, so it can only improve RLE if
+         lj matches a neighbor of i or li matches a neighbor of j. */
+      for (unsigned a = 0; a < nu; a++) {
+        unsigned i = used[a];
+        for (unsigned b = a + 1; b < nu; b++) {
+          unsigned j = used[b];
+          unsigned li = arr[i], lj = arr[j];
+          if (li == lj) continue;
+          long dData = ((long)cnts[i] - (long)cnts[j]) * ((long)lj - (long)li);
+          if (dData > max_ddata) continue;
+          int ok = ((i >= 1 && arr[i - 1] == lj) || (i + 1 < arr_len && arr[i + 1] == lj) ||
+                    (j >= 1 && arr[j - 1] == li) || (j + 1 < arr_len && arr[j + 1] == li));
+          if (!ok && thorough) {
+            ok = ((i >= 2 && arr[i - 2] == lj) || (i + 2 < arr_len && arr[i + 2] == lj) ||
+                  (j >= 2 && arr[j - 2] == li) || (j + 2 < arr_len && arr[j + 2] == li));
+          }
+          if (!ok) continue;
+          arr[i] = lj;
+          arr[j] = li;
+          size_t cand_data = (size_t)((long)cur_data + dData);
+          size_t tot = cand_data + FastTreeSizeNoAlloc(ll_lengths, d_lengths);
+          if (tot < cur_fast) {
+            cur_fast = tot;
+            cur_data = cand_data;
+            improved = 1;
+          } else {
+            arr[i] = li;
+            arr[j] = lj;
+          }
+        }
+      }
+
+      if (!thorough) continue;
+
+      /* 2b. 3-symbol Kraft-preserving split/merge moves. */
+      unsigned by_len[16][286];
+      unsigned by_cnt[16] = {0};
+      for (unsigned u = 0; u < nu; u++) {
+        unsigned idx = used[u];
+        unsigned L = arr[idx];
+        by_len[L][by_cnt[L]++] = idx;
+      }
+      /* Sort each length bucket ascending by symbol count. */
+      for (unsigned L = 1; L <= 15; L++) {
+        for (unsigned p = 1; p < by_cnt[L]; p++) {
+          unsigned v = by_len[L][p];
+          size_t cv = cnts[v];
+          unsigned q = p;
+          while (q > 0 && cnts[by_len[L][q - 1]] > cv) {
+            by_len[L][q] = by_len[L][q - 1];
+            q--;
+          }
+          by_len[L][q] = v;
+        }
+      }
+      /* Move A: arr[i]+=1, arr[j]-=1, arr[k]-=1 where arr[j]==arr[k]==L+2. */
+      for (unsigned L = 1; L <= 13; L++) {
+        unsigned nh = by_cnt[L], nl = by_cnt[L + 2];
+        if (!nh || nl < 2) continue;
+        unsigned pmax = nh < 6 ? nh : 6;
+        unsigned qstart = nl > 7 ? nl - 7 : 0;
+        for (unsigned p = 0; p < pmax; p++) {
+          unsigned i = by_len[L][p];
+          if (arr[i] != L) continue;
+          int i_helps = (len_freq[L] <= 3 || (i >= 1 && arr[i - 1] == L + 1) || (i + 1 < arr_len && arr[i + 1] == L + 1));
+          for (unsigned q = qstart; q < nl; q++) {
+            unsigned j = by_len[L + 2][q];
+            if (arr[j] != L + 2) continue;
+            int j_helps = i_helps || (len_freq[L + 2] <= 4 || (j >= 1 && arr[j - 1] == L + 1) || (j + 1 < arr_len && arr[j + 1] == L + 1));
+            for (unsigned r = q + 1; r < nl; r++) {
+              unsigned k = by_len[L + 2][r];
+              if (arr[k] != L + 2) continue;
+              if (!j_helps && !(k >= 1 && arr[k - 1] == L + 1) && !(k + 1 < arr_len && arr[k + 1] == L + 1)) continue;
+              long dData = (long)cnts[i] - (long)cnts[j] - (long)cnts[k];
+              if (dData > max_ddata) continue;
+              arr[i]++; arr[j]--; arr[k]--;
+              size_t cand_data = (size_t)((long)cur_data + dData);
+              size_t tot = cand_data + FastTreeSizeNoAlloc(ll_lengths, d_lengths);
+              if (tot < cur_fast) {
+                cur_fast = tot;
+                cur_data = cand_data;
+                improved = 1;
+                goto next_i_moveA;
+              } else {
+                arr[i]--; arr[j]++; arr[k]++;
+              }
+            }
+          }
+          next_i_moveA:;
+        }
+      }
+      /* Move B: arr[i]-=1, arr[j]+=1, arr[k]+=1 where arr[i]==arr[j]==arr[k]==L. */
+      for (unsigned L = 2; L <= 14; L++) {
+        unsigned ns = by_cnt[L];
+        if (ns < 3) continue;
+        unsigned hi_start = ns > 6 ? ns - 6 : 0;
+        unsigned lo_end = ns < 7 ? ns : 7;
+        for (unsigned p = hi_start; p < ns; p++) {
+          unsigned i = by_len[L][p];
+          if (arr[i] != L) continue;
+          int i_helps = (len_freq[L] <= 4 || (i >= 1 && arr[i - 1] == L - 1) || (i + 1 < arr_len && arr[i + 1] == L - 1));
+          for (unsigned q = 0; q < lo_end; q++) {
+            unsigned j = by_len[L][q];
+            if (j == i || arr[j] != L) continue;
+            int j_helps = i_helps || ((j >= 1 && arr[j - 1] == L + 1) || (j + 1 < arr_len && arr[j + 1] == L + 1));
+            for (unsigned r = q + 1; r < lo_end; r++) {
+              unsigned k = by_len[L][r];
+              if (k == i || arr[k] != L) continue;
+              if (!j_helps && !(k >= 1 && arr[k - 1] == L + 1) && !(k + 1 < arr_len && arr[k + 1] == L + 1)) continue;
+              long dData = -(long)cnts[i] + (long)cnts[j] + (long)cnts[k];
+              if (dData > max_ddata) continue;
+              arr[i]--; arr[j]++; arr[k]++;
+              size_t cand_data = (size_t)((long)cur_data + dData);
+              size_t tot = cand_data + FastTreeSizeNoAlloc(ll_lengths, d_lengths);
+              if (tot < cur_fast) {
+                cur_fast = tot;
+                cur_data = cand_data;
+                improved = 1;
+                goto next_i_moveB;
+              } else {
+                arr[i]++; arr[j]--; arr[k]--;
+              }
+            }
+          }
+          next_i_moveB:;
+        }
+      }
+    }
+    if (!improved) break;
+  }
+
+  /* Score final hill-climbed lengths with exact EncodeTreeDP. */
+  size_t hc_dp_total = cur_data + EncodeTreeDP(ll_lengths, d_lengths, 0, 0, 0);
+  if (hc_dp_total < best_dp_total) {
+    best_dp_total = hc_dp_total;
+    best_data = cur_data;
+    memcpy(best_ll, ll_lengths, sizeof(best_ll));
+    memcpy(best_d, d_lengths, sizeof(best_d));
+  } else {
+    memcpy(ll_lengths, best_ll, sizeof(best_ll));
+    memcpy(d_lengths, best_d, sizeof(best_d));
+    cur_data = best_data;
+  }
+
+  /* 3. Only on final polish (thorough >= 2), run one exact-EncodeTreeDP neighbor swap pass. */
+  if (thorough >= 2) {
+    for (int kind = 0; kind < 2; kind++) {
+      if (kind == 1 && n_d < 2) continue;
+      unsigned* arr = kind == 0 ? ll_lengths : d_lengths;
+      const size_t* cnts = kind == 0 ? ll_counts : d_counts;
+      unsigned* used = kind == 0 ? used_ll_idx : used_d_idx;
+      unsigned nu = kind == 0 ? n_ll : n_d;
+      unsigned arr_len = kind == 0 ? 286 : 30;
+
+      for (unsigned a = 0; a < nu; a++) {
+        unsigned i = used[a];
+        for (unsigned b = a + 1; b < nu; b++) {
+          unsigned j = used[b];
+          unsigned li = arr[i], lj = arr[j];
+          if (li == lj) continue;
+          long dData = ((long)cnts[i] - (long)cnts[j]) * ((long)lj - (long)li);
+          if (dData > 10) continue;
+          if (!((i >= 1 && arr[i - 1] == lj) || (i + 1 < arr_len && arr[i + 1] == lj) ||
+                (j >= 1 && arr[j - 1] == li) || (j + 1 < arr_len && arr[j + 1] == li))) {
+            continue;
+          }
+          arr[i] = lj;
+          arr[j] = li;
+          size_t cand_data = (size_t)((long)best_data + dData);
+          size_t tot = cand_data + EncodeTreeDP(ll_lengths, d_lengths, 0, 0, 0);
+          if (tot < best_dp_total) {
+            best_dp_total = tot;
+            best_data = cand_data;
+          } else {
+            arr[i] = li;
+            arr[j] = lj;
+          }
+        }
+      }
+    }
+  }
+
+  if (out_data) *out_data = best_data;
+  return best_dp_total;
+}
+
 /*
 Calculates the bit lengths for the symbols for dynamic blocks. Chooses bit
 lengths that give the smallest size of tree encoding + encoding of all the
@@ -695,7 +1179,6 @@ static size_t GetAdvancedLengths(const unsigned short* litlens,
   size_t d_counts2[32];
   size_t ll_counts3[288];
   size_t d_counts3[32];
-  unsigned dummy;
 
   ZopfliLZ77Counts(litlens, dists, lstart, lend, ll_counts, d_counts, symbols);
   memcpy(ll_counts2, ll_counts, 288 * sizeof(size_t));
@@ -715,51 +1198,26 @@ static size_t GetAdvancedLengths(const unsigned short* litlens,
   for (int k = 0; k < 3; k++) {
     ZopfliLengthLimitedCodeLengths(ll_c[k], 288, 15, ll_cand[k]);
     ZopfliLengthLimitedCodeLengths(d_c[k], 32, 15, d_cand[k]);
+    PatchDistanceCodesForBuggyDecoders(d_cand[k]);
   }
 
   size_t best = ~(size_t)0;
-  unsigned nix = 0;
-  size_t* lcounts = ll_counts;
-  size_t* dcounts = d_counts;
   for (int a = 0; a < 3; a++) {
     for (int b = 0; b < 3; b++) {
       size_t sym = CalculateBlockSymbolSize(ll_counts2, d_counts2, ll_cand[a], d_cand[b]);
       if (a != b && sym + 60 >= best) continue;
-      unsigned tr = CalculateTreeSize(ll_cand[a], d_cand[b], 2, &dummy);
+      size_t tr = FastTreeSizeNoAlloc(ll_cand[a], d_cand[b]);
       if (sym + tr < best) {
         best = sym + tr;
-        nix = tr;
-        lcounts = ll_c[a];
-        dcounts = d_c[b];
         memcpy(ll_lengths, ll_cand[a], sizeof(unsigned) * 288);
         memcpy(d_lengths, d_cand[b], sizeof(unsigned) * 32);
       }
     }
   }
 
-  unsigned ll_lengths2[288];
-  unsigned d_lengths2[32];
-  unsigned maxbits = 15;
-  while(--maxbits > 8){
-    ZopfliLengthLimitedCodeLengths(lcounts, 288, maxbits, ll_lengths2);
-    ZopfliLengthLimitedCodeLengths(dcounts, 32, maxbits, d_lengths2);
-    size_t next = CalculateBlockSymbolSize(ll_counts2, d_counts2, ll_lengths2, d_lengths2);
-    unsigned nextnix = CalculateTreeSize(ll_lengths2, d_lengths2, 2, &dummy);
-    next += nextnix;
-
-    if(next < best){
-      best = next;
-      memcpy(ll_lengths, ll_lengths2, sizeof(unsigned) * 286);
-      memcpy(d_lengths, d_lengths2, sizeof(unsigned) * 30);
-      nix = nextnix;
-    }
-    else if (best < next){
-      break;
-    }
-  }
-
-  best -= nix;
-  return best;
+  size_t data_bits = 0;
+  OptimizeCodeLengthsHillClimb(ll_counts2, d_counts2, ll_lengths, d_lengths, 0, &data_bits);
+  return data_bits;
 }
 
 size_t GetDynamicLengthsuse(unsigned* ll_lengths, unsigned* d_lengths, const size_t* ll_counts, const size_t* d_counts) {
@@ -878,11 +1336,12 @@ double ZopfliCalculateBlockSize(const unsigned short* litlens,
 
 static unsigned char ReplaceBadCodes(unsigned short** litlens,
                             unsigned short** dists,
-                            size_t* lend, const unsigned char* in, size_t instart, unsigned* ll_lengths, unsigned* d_lengths){
+                            size_t* lend, size_t max_out, const unsigned char* in, size_t instart, unsigned* ll_lengths, unsigned* d_lengths){
   size_t end = *lend;
+  size_t alloc_n = (max_out > end ? max_out : end) + 1;
 
-  unsigned short* litlens2 = (unsigned short*)malloc(end * 3 * sizeof(unsigned short));
-  unsigned short* dists2 = (unsigned short*)malloc(end * 3 * sizeof(unsigned short));
+  unsigned short* litlens2 = (unsigned short*)malloc(alloc_n * sizeof(unsigned short));
+  unsigned short* dists2 = (unsigned short*)malloc(alloc_n * sizeof(unsigned short));
   if (!(litlens2 && dists2)){
     exit(1);
   }
@@ -892,7 +1351,7 @@ static unsigned char ReplaceBadCodes(unsigned short** litlens,
   for (size_t i = 0; i < end; i++){
     unsigned char change = 0;
     size_t length = (*dists)[i] == 0 ? 1 : (*litlens)[i];
-    if (length >= 3 && length <= 7){
+    if (length >= 3 && length <= 18){
       /*Check if the match is cheaper than several literals*/
       const unsigned char* litplace = &in[pos - (*dists)[i]];
       unsigned litprice = 0;
@@ -906,7 +1365,7 @@ static unsigned char ReplaceBadCodes(unsigned short** litlens,
         litprice += ll_lengths[*litplace++];
       }
       if (cont){
-        unsigned char distprice = ll_lengths[ZopfliGetLengthSymbol(length)] + ZopfliGetLengthExtraBits(length) + ZopfliGetDistExtraBits((*dists)[i])
+        unsigned distprice = ll_lengths[ZopfliGetLengthSymbol(length)] + ZopfliGetLengthExtraBits(length) + ZopfliGetDistExtraBits((*dists)[i])
           + d_lengths[ZopfliGetDistSymbol((*dists)[i])];
         if (litprice < distprice){
           litplace = &in[pos - (*dists)[i]];
@@ -997,7 +1456,7 @@ static void AddLZ77Block(int btype, int final,
       if (!(i & 1)){
         unsigned short * free1 = litlens;
         unsigned short * free2 = dists;
-        change = ReplaceBadCodes(&litlens, &dists, &lend, in, instart, ll_lengths, d_lengths);
+        change = ReplaceBadCodes(&litlens, &dists, &lend, expected_data_size, in, instart, ll_lengths, d_lengths);
         if (change) any_change = 1;
         if (!change && i + 1 != replaceCodes && i){
           outpred += CalculateTreeSize(ll_lengths, d_lengths, hq, &best);
@@ -1018,14 +1477,16 @@ static void AddLZ77Block(int btype, int final,
     }
     if (advanced) {
       outpred = 3 + GetAdvancedLengths(litlens, dists, 0, lend, ll_lengths, d_lengths, 0);
-      outpred += CalculateTreeSize(ll_lengths, d_lengths, 2, &best);
+      outpred += EncodeTreeDP(ll_lengths, d_lengths, 0, 0, 0);
     }
     if (any_change) {
       unsigned orig_ll[288], orig_d[32], orig_best = 0;
       size_t orig_pred = 3 + (advanced
         ? GetAdvancedLengths(orig_litlens, orig_dists, 0, orig_lend, orig_ll, orig_d, 0)
         : GetDynamicLengths(orig_litlens, orig_dists, 0, orig_lend, orig_ll, orig_d, 0));
-      orig_pred += CalculateTreeSize(orig_ll, orig_d, advanced ? 2 : hq, &orig_best);
+      orig_pred += advanced
+        ? EncodeTreeDP(orig_ll, orig_d, 0, 0, 0)
+        : CalculateTreeSize(orig_ll, orig_d, hq, &orig_best);
       if (orig_pred < outpred) {
         free(litlens);
         free(dists);
@@ -1056,10 +1517,14 @@ static void AddLZ77Block(int btype, int final,
   AddBit((btype & 2) >> 1, bp, out, outsize);
 
   if (btype == 2){
-    PatchDistanceCodesForBuggyDecoders(d_lengths);
-    EncodeTree(ll_lengths, d_lengths,
-               best & 1, best & 2, best & 4, best & 8 , best & 16 || (hq == 1 && best == 9 && !advanced),
-               bp, *out, outsize);
+    if (advanced) {
+      EncodeTreeDP(ll_lengths, d_lengths, bp, *out, outsize);
+    } else {
+      PatchDistanceCodesForBuggyDecoders(d_lengths);
+      EncodeTree(ll_lengths, d_lengths,
+                 best & 1, best & 2, best & 4, best & 8 , best & 16 || (hq == 1 && best == 9 && !advanced),
+                 bp, *out, outsize);
+    }
   }
   ZopfliLengthsToSymbols(ll_lengths, 288, 15, ll_symbols);
   ZopfliLengthsToSymbols(d_lengths, 32, 15, d_symbols);
@@ -1533,4 +1998,420 @@ void ZopfliDeflate(const ZopfliOptions* options, int final,
     i += size;
   }
 #endif
+}
+
+/* js13k-zip: self-contained RFC 1951 dynamic block decoder + exact post-search
+   block polisher (joint all-distance DP + thorough Kraft hill-climb + DP tree
+   encoding + rare/singleton symbol elimination). */
+namespace {
+
+struct PolishBitReader {
+  const unsigned char* buf;
+  size_t pos;
+  size_t limit;
+  unsigned read(unsigned n) {
+    unsigned v = 0;
+    for (unsigned i = 0; i < n; i++) {
+      if (pos >= limit) { pos = limit + 1; return 0; }
+      v |= (unsigned)((buf[pos >> 3] >> (pos & 7)) & 1) << i;
+      pos++;
+    }
+    return v;
+  }
+};
+
+struct PuffTable {
+  short count[16];
+  short symbol[288];
+};
+
+static int build_puff(const unsigned* lengths, int n, PuffTable* t) {
+  int offs[16];
+  for (int len = 0; len <= 15; len++) t->count[len] = 0;
+  for (int i = 0; i < n; i++) {
+    if (lengths[i] > 15) return 0;
+    t->count[lengths[i]]++;
+  }
+  offs[1] = 0;
+  for (int len = 1; len < 15; len++) offs[len + 1] = offs[len] + t->count[len];
+  for (int i = 0; i < n; i++) {
+    if (lengths[i]) t->symbol[offs[lengths[i]]++] = (short)i;
+  }
+  return 1;
+}
+
+static int decode_puff(PolishBitReader* br, const PuffTable* t) {
+  int code = 0, first = 0, index = 0;
+  for (int len = 1; len <= 15; len++) {
+    code |= (int)br->read(1);
+    if (br->pos > br->limit) return -1;
+    int cnt = t->count[len];
+    if (code - cnt < first) return t->symbol[index + (code - first)];
+    index += cnt;
+    first += cnt;
+    first <<= 1;
+    code <<= 1;
+  }
+  return -1;
+}
+
+static int DecodeDynamicBlockToStore(const unsigned char* block_data, size_t nbits,
+                                     size_t expected_bytes,
+                                     ZopfliLZ77Store* store,
+                                     unsigned* out_ll, unsigned* out_d) {
+  static const unsigned cl_order[19] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+  };
+  static const unsigned short len_base[29] = {
+    3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
+  };
+  static const unsigned char len_extra[29] = {
+    0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0
+  };
+  static const unsigned short dist_base[30] = {
+    1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577
+  };
+  static const unsigned char dist_extra[30] = {
+    0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13
+  };
+
+  PolishBitReader br = { block_data, 0, nbits };
+  br.read(1); /* bfinal */
+  unsigned btype = br.read(2);
+  if (btype != 2) return 0;
+
+  unsigned hlit = br.read(5) + 257;
+  unsigned hdist = br.read(5) + 1;
+  unsigned hclen = br.read(4) + 4;
+  if (hlit > 286 || hdist > 30 || br.pos > nbits) return 0;
+
+  unsigned clcl[19] = {0};
+  for (unsigned i = 0; i < hclen; i++) clcl[cl_order[i]] = br.read(3);
+  PuffTable cl_tab;
+  if (!build_puff(clcl, 19, &cl_tab)) return 0;
+
+  unsigned lens[316] = {0};
+  unsigned total_lens = hlit + hdist;
+  unsigned idx = 0;
+  while (idx < total_lens) {
+    int s = decode_puff(&br, &cl_tab);
+    if (s < 0) return 0;
+    if (s < 16) {
+      lens[idx++] = (unsigned)s;
+    } else if (s == 16) {
+      if (idx == 0) return 0;
+      unsigned rep = br.read(2) + 3;
+      unsigned prev = lens[idx - 1];
+      if (idx + rep > total_lens) return 0;
+      while (rep--) lens[idx++] = prev;
+    } else if (s == 17) {
+      unsigned rep = br.read(3) + 3;
+      if (idx + rep > total_lens) return 0;
+      while (rep--) lens[idx++] = 0;
+    } else {
+      unsigned rep = br.read(7) + 11;
+      if (idx + rep > total_lens) return 0;
+      while (rep--) lens[idx++] = 0;
+    }
+  }
+  memset(out_ll, 0, sizeof(unsigned) * 288);
+  memset(out_d, 0, sizeof(unsigned) * 32);
+  for (unsigned i = 0; i < hlit; i++) out_ll[i] = lens[i];
+  for (unsigned i = 0; i < hdist; i++) out_d[i] = lens[hlit + i];
+
+  PuffTable ll_tab, d_tab;
+  if (!build_puff(out_ll, 286, &ll_tab) || !build_puff(out_d, 30, &d_tab)) return 0;
+
+  ZopfliInitLZ77Store(store);
+  store->litlens = (unsigned short*)malloc((expected_bytes + 1) * sizeof(unsigned short));
+  store->dists = (unsigned short*)malloc((expected_bytes + 1) * sizeof(unsigned short));
+  if (!store->litlens || !store->dists) exit(1);
+
+  size_t out_bytes = 0;
+  for (;;) {
+    int s = decode_puff(&br, &ll_tab);
+    if (s < 0) { ZopfliCleanLZ77Store(store); ZopfliInitLZ77Store(store); return 0; }
+    if (s == 256) break;
+    if (s < 256) {
+      if (store->size >= expected_bytes) { ZopfliCleanLZ77Store(store); ZopfliInitLZ77Store(store); return 0; }
+      store->litlens[store->size] = (unsigned short)s;
+      store->dists[store->size] = 0;
+      store->size++;
+      out_bytes++;
+    } else {
+      if (s > 285) { ZopfliCleanLZ77Store(store); ZopfliInitLZ77Store(store); return 0; }
+      unsigned len = len_base[s - 257] + br.read(len_extra[s - 257]);
+      int ds = decode_puff(&br, &d_tab);
+      if (ds < 0 || ds >= 30) { ZopfliCleanLZ77Store(store); ZopfliInitLZ77Store(store); return 0; }
+      unsigned dist = dist_base[ds] + br.read(dist_extra[ds]);
+      if (store->size >= expected_bytes) { ZopfliCleanLZ77Store(store); ZopfliInitLZ77Store(store); return 0; }
+      store->litlens[store->size] = (unsigned short)len;
+      store->dists[store->size] = (unsigned short)dist;
+      store->size++;
+      out_bytes += len;
+    }
+  }
+  if (out_bytes != expected_bytes || br.pos != nbits) {
+    ZopfliCleanLZ77Store(store);
+    ZopfliInitLZ77Store(store);
+    return 0;
+  }
+  return 1;
+}
+
+static int StoresEqual(const ZopfliLZ77Store* a, const ZopfliLZ77Store* b) {
+  if (a->size != b->size) return 0;
+  size_t bytes = a->size * sizeof(unsigned short);
+  return !memcmp(a->litlens, b->litlens, bytes) && !memcmp(a->dists, b->dists, bytes);
+}
+
+static size_t EvalStoreThorough(const ZopfliLZ77Store* store,
+                                const unsigned* warm_ll, const unsigned* warm_d,
+                                unsigned* out_ll, unsigned* out_d,
+                                int thorough, size_t best_limit) {
+  size_t ll_raw[288], d_raw[32];
+  size_t ll_rle1[288], d_rle1[32];
+  size_t ll_rle2[288], d_rle2[32];
+  ZopfliLZ77Counts(store->litlens, store->dists, 0, store->size, ll_raw, d_raw, 0);
+  memcpy(ll_rle1, ll_raw, sizeof(ll_raw));
+  memcpy(d_rle1, d_raw, sizeof(d_raw));
+  memcpy(ll_rle2, ll_raw, sizeof(ll_raw));
+  memcpy(d_rle2, d_raw, sizeof(d_raw));
+  OptimizeHuffmanCountsForRle(288, ll_rle1);
+  OptimizeHuffmanCountsForRle(32, d_rle1);
+  OptimizeHuffmanCountsForRlezop(288, ll_rle2);
+  OptimizeHuffmanCountsForRlezop(32, d_rle2);
+
+  size_t* ll_c[3] = { ll_rle1, ll_rle2, ll_raw };
+  size_t* d_c[3] = { d_rle1, d_rle2, d_raw };
+  unsigned ll_cand[3][288], d_cand[3][32];
+  for (int k = 0; k < 3; k++) {
+    ZopfliLengthLimitedCodeLengths(ll_c[k], 288, 15, ll_cand[k]);
+    ZopfliLengthLimitedCodeLengths(d_c[k], 32, 15, d_cand[k]);
+    PatchDistanceCodesForBuggyDecoders(d_cand[k]);
+  }
+
+  size_t best_fast = ~(size_t)0;
+  unsigned cur_ll[288], cur_d[32];
+  for (int a = 0; a < 3; a++) {
+    for (int b = 0; b < 3; b++) {
+      size_t db = CalculateBlockSymbolSize(ll_raw, d_raw, ll_cand[a], d_cand[b]);
+      if (a != b && db + 64 >= best_fast) continue;
+      size_t tot = db + FastTreeSizeNoAlloc(ll_cand[a], d_cand[b]);
+      if (tot < best_fast) {
+        best_fast = tot;
+        memcpy(cur_ll, ll_cand[a], sizeof(cur_ll));
+        memcpy(cur_d, d_cand[b], sizeof(cur_d));
+      }
+    }
+  }
+
+  int warm_ok = 0;
+  size_t warm_fast = ~(size_t)0;
+  if (warm_ll && warm_d) {
+    warm_ok = 1;
+    for (int i = 0; i < 286; i++) if (ll_raw[i] && !warm_ll[i]) { warm_ok = 0; break; }
+    for (int i = 0; i < 30 && warm_ok; i++) if (d_raw[i] && !warm_d[i]) { warm_ok = 0; break; }
+    if (warm_ok) {
+      warm_fast = CalculateBlockSymbolSize(ll_raw, d_raw, warm_ll, warm_d) + FastTreeSizeNoAlloc(warm_ll, warm_d);
+    }
+  }
+
+  /* Fast reject hopeless candidates before running thorough hill-climbing. */
+  size_t screen_min = warm_fast < best_fast ? warm_fast : best_fast;
+  if (best_limit && 3 + screen_min > best_limit + 16) {
+    return 3 + screen_min;
+  }
+
+  size_t best_total = 3 + OptimizeCodeLengthsHillClimb(ll_raw, d_raw, cur_ll, cur_d, thorough, 0);
+  memcpy(out_ll, cur_ll, sizeof(cur_ll));
+  memcpy(out_d, cur_d, sizeof(cur_d));
+
+  if (warm_ok) {
+    unsigned w_ll[288], w_d[32];
+    memcpy(w_ll, warm_ll, sizeof(w_ll));
+    memcpy(w_d, warm_d, sizeof(w_d));
+    size_t wtot = 3 + OptimizeCodeLengthsHillClimb(ll_raw, d_raw, w_ll, w_d, thorough, 0);
+    if (wtot < best_total) {
+      best_total = wtot;
+      memcpy(out_ll, w_ll, sizeof(w_ll));
+      memcpy(out_d, w_d, sizeof(w_d));
+    }
+  }
+  return best_total;
+}
+
+} /* anonymous namespace */
+
+int EctPolishBlock(const unsigned char* in, size_t instart, size_t inend,
+                   const unsigned char* orig_block, size_t orig_nbits,
+                   unsigned char* bp, unsigned char** out, size_t* outsize) {
+  size_t blocksize = inend - instart;
+  if (!blocksize || !orig_nbits) return 0;
+
+  ZopfliLZ77Store best_store;
+  unsigned init_ll[288], init_d[32];
+  if (!DecodeDynamicBlockToStore(orig_block, orig_nbits, blocksize, &best_store, init_ll, init_d)) {
+    return 0;
+  }
+
+  unsigned best_ll[288], best_d[32];
+  size_t best_total = EvalStoreThorough(&best_store, init_ll, init_d, best_ll, best_d, 1, 0);
+
+  EctUltraMatchCache ucache;
+  EctBuildAllMatches(in, instart, inend, 4096, &ucache);
+
+  ZopfliLZ77Store cand_store;
+  ZopfliInitLZ77Store(&cand_store);
+  unsigned cand_ll[288], cand_d[32];
+  unsigned short ll_cost[288], d_cost[32];
+
+  /* 1. Joint fixed-point all-distance DP + thorough Kraft tree hill-climb. */
+  const unsigned short pens[4] = { 120, 16, 14, 120 };
+  for (int pi = 0; pi < 4; pi++) {
+    unsigned short pen = pens[pi];
+    for (int it = 0; it < 5; it++) {
+      for (int j = 0; j < 288; j++) ll_cost[j] = best_ll[j] ? (unsigned short)best_ll[j] : pen;
+      for (int j = 0; j < 32; j++) d_cost[j] = best_d[j] ? (unsigned short)best_d[j] : pen;
+      EctRunAllDistDP(in, instart, inend, &ucache, ll_cost, d_cost, &cand_store);
+      if (StoresEqual(&cand_store, &best_store)) break;
+      size_t cand_total = EvalStoreThorough(&cand_store, best_ll, best_d, cand_ll, cand_d, 1, best_total);
+      if (cand_total < best_total) {
+        best_total = cand_total;
+        ZopfliCopyLZ77Store(&cand_store, &best_store);
+        memcpy(best_ll, cand_ll, sizeof(best_ll));
+        memcpy(best_d, cand_d, sizeof(best_d));
+      } else {
+        break;
+      }
+    }
+  }
+
+  /* 2. Rare / singleton / tail symbol elimination. */
+  int any_elim = 0;
+  for (int sweep = 0; sweep < 8; sweep++) {
+    size_t ll_counts[288], d_counts[32];
+    ZopfliLZ77Counts(best_store.litlens, best_store.dists, 0, best_store.size, ll_counts, d_counts, 0);
+
+    int top_ll = -1, top_d = -1;
+    for (int s = 285; s >= 257; s--) if (ll_counts[s]) { top_ll = s; break; }
+    for (int d = 29; d >= 0; d--) if (d_counts[d]) { top_d = d; break; }
+
+    unsigned char ckind[320];
+    unsigned short csym[320];
+    unsigned ncands = 0;
+    unsigned char seen_ll[288] = {0}, seen_d[32] = {0};
+
+    if (top_ll >= 257 && ll_counts[top_ll] <= 4) {
+      ckind[ncands] = 0; csym[ncands++] = (unsigned short)top_ll; seen_ll[top_ll] = 1;
+    }
+    if (top_d >= 0 && d_counts[top_d] <= 4) {
+      ckind[ncands] = 1; csym[ncands++] = (unsigned short)top_d; seen_d[top_d] = 1;
+    }
+    for (int s = 257; s < 286; s++) {
+      if (!seen_ll[s] && ll_counts[s] > 0 && ll_counts[s] <= 2) {
+        ckind[ncands] = 0; csym[ncands++] = (unsigned short)s; seen_ll[s] = 1;
+      }
+    }
+    for (int d = 0; d < 30; d++) {
+      if (!seen_d[d] && d_counts[d] > 0 && d_counts[d] <= 2) {
+        ckind[ncands] = 1; csym[ncands++] = (unsigned short)d; seen_d[d] = 1;
+      }
+    }
+    unsigned lit_cands = 0;
+    for (int s = 0; s < 256 && lit_cands < 12; s++) {
+      if (ll_counts[s] == 1 &&
+          ((s == 0 || best_ll[s - 1] == 0) || (s == 255 || best_ll[s + 1] == 0))) {
+        ckind[ncands] = 0; csym[ncands++] = (unsigned short)s;
+        lit_cands++;
+      }
+    }
+
+    int improved = 0;
+    for (unsigned ci = 0; ci < ncands; ci++) {
+      for (int j = 0; j < 288; j++) ll_cost[j] = best_ll[j] ? (unsigned short)best_ll[j] : 120;
+      for (int j = 0; j < 32; j++) d_cost[j] = best_d[j] ? (unsigned short)best_d[j] : 120;
+      if (ckind[ci] == 0) ll_cost[csym[ci]] = 1000;
+      else d_cost[csym[ci]] = 1000;
+
+      EctRunAllDistDP(in, instart, inend, &ucache, ll_cost, d_cost, &cand_store);
+      if (StoresEqual(&cand_store, &best_store)) continue;
+      size_t cand_total = EvalStoreThorough(&cand_store, best_ll, best_d, cand_ll, cand_d, 1, best_total);
+      if (cand_total < best_total) {
+        best_total = cand_total;
+        ZopfliCopyLZ77Store(&cand_store, &best_store);
+        memcpy(best_ll, cand_ll, sizeof(best_ll));
+        memcpy(best_d, cand_d, sizeof(best_d));
+        improved = 1;
+        any_elim = 1;
+        break;
+      }
+    }
+    if (!improved) break;
+  }
+
+  if (any_elim) {
+    for (int it = 0; it < 3; it++) {
+      for (int j = 0; j < 288; j++) ll_cost[j] = best_ll[j] ? (unsigned short)best_ll[j] : 120;
+      for (int j = 0; j < 32; j++) d_cost[j] = best_d[j] ? (unsigned short)best_d[j] : 120;
+      EctRunAllDistDP(in, instart, inend, &ucache, ll_cost, d_cost, &cand_store);
+      if (StoresEqual(&cand_store, &best_store)) break;
+      size_t cand_total = EvalStoreThorough(&cand_store, best_ll, best_d, cand_ll, cand_d, 1, best_total);
+      if (cand_total < best_total) {
+        best_total = cand_total;
+        ZopfliCopyLZ77Store(&cand_store, &best_store);
+        memcpy(best_ll, cand_ll, sizeof(best_ll));
+        memcpy(best_d, cand_d, sizeof(best_d));
+      } else {
+        break;
+      }
+    }
+  }
+
+  /* 3. One final exact-EncodeTreeDP swap refinement on the winning store. */
+  {
+    size_t final_tot = EvalStoreThorough(&best_store, best_ll, best_d, cand_ll, cand_d, 2, 0);
+    if (final_tot < best_total) {
+      best_total = final_tot;
+      memcpy(best_ll, cand_ll, sizeof(best_ll));
+      memcpy(best_d, cand_d, sizeof(best_d));
+    }
+  }
+
+  ZopfliCleanLZ77Store(&cand_store);
+  EctFreeAllMatches(&ucache);
+
+  if (best_total >= orig_nbits) {
+    ZopfliCleanLZ77Store(&best_store);
+    return 0;
+  }
+
+  /* Emit the polished block (bfinal = 0, btype = 2). */
+  size_t bitstart = *outsize * 8 + *bp - ((*bp != 0) * 8);
+  size_t outpred = bitstart + best_total;
+  (*out) = (unsigned char*)realloc(*out, outpred / 8 + 1 + 8);
+  if (!(*out)) exit(1);
+  memset(&((*out)[*outsize]), 0, outpred / 8 + (!!(outpred & 7)) - (*outsize) + 8);
+
+  AddBit(0, bp, out, outsize);
+  AddBit(0, bp, out, outsize);
+  AddBit(1, bp, out, outsize);
+  EncodeTreeDP(best_ll, best_d, bp, *out, outsize);
+
+  unsigned ll_symbols[288], d_symbols[32];
+  ZopfliLengthsToSymbols(best_ll, 288, 15, ll_symbols);
+  ZopfliLengthsToSymbols(best_d, 32, 15, d_symbols);
+  AddLZ77Data(best_store.litlens, best_store.dists, 0, best_store.size,
+              blocksize, ll_symbols, best_ll, d_symbols, best_d,
+              bp, *out, outsize);
+#ifdef FAST_BITWRITER
+  AddBits(ll_symbols[256], best_ll[256], bp, *out, outsize);
+#else
+  AddHuffmanBits(ll_symbols[256], best_ll[256], bp, *out, outsize);
+#endif
+  size_t bitend = *outsize * 8 + *bp - ((*bp != 0) * 8);
+  assert(bitend == outpred);
+  ect_record_block(instart, inend, bitstart, bitend);
+  ZopfliCleanLZ77Store(&best_store);
+  return 1;
 }

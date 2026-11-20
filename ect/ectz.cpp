@@ -79,4 +79,20 @@ size_t ect_cost_state_size(void) { size_t n; ect_cost_state(&n); return n; }
 unsigned char* ect_output(void) { return g_out; }
 size_t ect_block_count(void) { return g_nblocks; }
 unsigned* ect_blocks(void) { return g_blocks; }
+
+/* Post-search exact polish of a single emitted block [instart, inend).
+   Returns output size (> 0) and records 1 block if strictly smaller, else 0. */
+size_t ect_polish_block(const unsigned char* in, size_t instart, size_t inend,
+                        const unsigned char* block_data, size_t block_nbits) {
+  free(g_out); g_out = 0; g_outsize = 0;
+  g_nblocks = 0;
+  ect_pass = 0;
+  unsigned char bp = 0;
+  if (!EctPolishBlock(in, instart, inend, block_data, block_nbits, &bp, &g_out, &g_outsize)) {
+    free(g_out); g_out = 0; g_outsize = 0;
+    g_nblocks = 0;
+    return 0;
+  }
+  return g_outsize;
+}
 }

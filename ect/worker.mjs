@@ -11,6 +11,7 @@ const ready = createEngine();
 async function handle({ id, kind, bytes, ...args }) {
   const E = await ready;
   if (kind === 'task') return { id, task: E.passTask(bytes, args) };
+  if (kind === 'polish') return { id, block: E.polishBlock(bytes, args.block) };
   return { id, passes: E.deflate(bytes, args.mode, args.seed, args.start, args.end) };
 }
 
